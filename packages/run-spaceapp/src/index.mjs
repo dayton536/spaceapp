@@ -222,13 +222,17 @@ const PODMAN_CLI_NNP_BLOCK = [
 export function composeFileForEngine(template, engine = "docker") {
   if (typeof template !== "string") throw new Error("Compose template must be text.");
   if (resolveEngine(engine) !== "podman") return template;
-  if (!template.includes(PODMAN_CLI_NNP_BLOCK)) {
+  // Windows checkouts use CRLF. Match the marker on LF, then restore the file's newline.
+  const crlf = template.includes("\r\n");
+  const normalized = crlf ? template.replace(/\r\n/g, "\n") : template;
+  if (!normalized.includes(PODMAN_CLI_NNP_BLOCK)) {
     throw new Error("Podman compose template is missing the spaceapp-cli no-new-privileges block.");
   }
-  return template.replace(
+  const rewritten = normalized.replace(
     PODMAN_CLI_NNP_BLOCK,
     "    # Podman keep-id maps container uid 10001 to the host user. no-new-privileges blocks gosu from switching to that uid.\n"
   );
+  return crlf ? rewritten.replace(/\n/g, "\r\n") : rewritten;
 }
 
 export function versionTuple(version) {

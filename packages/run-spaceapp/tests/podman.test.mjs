@@ -395,6 +395,15 @@ test("composeFileForEngine drops no-new-privileges only on the Podman CLI servic
   assert.doesNotMatch(cliSection, /no-new-privileges/);
   assert.match(podmanTemplate, /no-new-privileges:true/);
   assert.match(podmanTemplate, /gosu/);
+
+  const crlf = template.replace(/\n/g, "\r\n");
+  assert.equal(composeFileForEngine(crlf, "docker"), crlf);
+  const crlfPodman = composeFileForEngine(crlf, "podman");
+  assert.equal(crlfPodman.includes("\r\n"), true);
+  assert.equal(crlfPodman.replaceAll("\r\n", "").includes("\n"), false);
+  const crlfCli = crlfPodman.split("  codex-sessions-init:")[0].split("  spaceapp-cli:")[1];
+  assert.doesNotMatch(crlfCli, /no-new-privileges/);
+  assert.match(crlfPodman, /no-new-privileges:true/);
 });
 
 test("podman machine inspect values and profile resize advice", () => {
