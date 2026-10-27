@@ -119,6 +119,7 @@ const ALL_PROVIDERS = new Set(Object.values(PROVIDERS).flat());
 export const CLI_SETTINGS_FILES = Object.freeze([
   "claude/settings.json", "claude/.claude.json", "codex/config.toml", "opencode/config/opencode/opencode.json"
 ]);
+export const SUPPORTED_ENGINES = Object.freeze(["docker", "podman"]);
 const CONFIG_KEYS = new Set([
   "schemaVersion",
   "version",
@@ -128,6 +129,7 @@ const CONFIG_KEYS = new Set([
   "telemetry",
   "profile",
   "accessMode",
+  "engine",
   "workspaces",
   "companionsEnabled",
   "optionalModules",
@@ -195,6 +197,38 @@ export function resolveInstallAccessMode(requestedMode, existingMode = "isolated
     return requestedMode;
   }
   throw new Error("Install access mode must be isolated or host-root.");
+}
+
+export function resolveEngine(configOrEngine = "docker") {
+  const candidate = typeof configOrEngine === "string"
+    ? configOrEngine
+    : configOrEngine?.engine ?? "docker";
+  if (!SUPPORTED_ENGINES.includes(candidate)) {
+    throw new Error("Container engine must be docker or podman.");
+  }
+  return candidate;
+}
+
+// The published images start as root and `gosu` to uid 10001. Rootless `keep-id:uid=10001`
+// maps that uid to the host user, but `no-new-privileges` then makes the switch fail with
+// "operation not permitted". Drop that option only on spaceapp-cli for Podman.
+const PODMAN_CLI_NNP_BLOCK = [
+  "    # compose.workspaces.yml adds the user-namespace profile where the host allows user namespaces (F17).",
+  "    security_opt:",
+  "      - no-new-privileges:true",
+  ""
+].join("\n");
+
+export function composeFileForEngine(template, engine = "docker") {
+  if (typeof template !== "string") throw new Error("Compose template must be text.");
+  if (resolveEngine(engine) !== "podman") return template;
+  if (!template.includes(PODMAN_CLI_NNP_BLOCK)) {
+    throw new Error("Podman compose template is missing the spaceapp-cli no-new-privileges block.");
+  }
+  return template.replace(
+    PODMAN_CLI_NNP_BLOCK,
+    "    # Podman keep-id maps container uid 10001 to the host user. no-new-privileges blocks gosu from switching to that uid.\n"
+  );
 }
 
 export function versionTuple(version) {
@@ -311,13 +345,20 @@ export function createDefaultConfig({
   version,
   profile = "light",
   accessMode = "isolated",
-  companionsEnabled = false
+  companionsEnabled = false,
+  engine
 }) {
   assertVersion(version);
   if (!INSTALL_PROFILES.includes(profile)) {
     throw new Error("Default config requires a resolved installation profile.");
   }
   const resolvedAccessMode = resolveInstallAccessMode(accessMode);
+  const resolvedEngine = engine === undefined ? undefined : resolveEngine(engine);
+  if (resolvedEngine === "podman" && resolvedAccessMode === "host-root") {
+    throw new Error(
+      `Host-root access (--access host-root) is not supported on Podman because rootless user namespaces remap host UIDs. Use --access isolated or register specific folders with "${UNIVERSAL_COMMAND} workspace add <path>".`
+    );
+  }
   return {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     version,
@@ -327,6 +368,7 @@ export function createDefaultConfig({
     telemetry: false,
     profile,
     accessMode: resolvedAccessMode,
+    ...(resolvedEngine === "podman" ? { engine: "podman" } : {}),
     companionsEnabled,
     optionalModules: "none",
     workspaces: []
@@ -366,6 +408,14 @@ export function validateConfig(config) {
   }
   if (config.accessMode !== "isolated" && config.accessMode !== "host-root") {
     throw new Error("accessMode must be isolated or host-root.");
+  }
+  if (config.engine !== undefined && !SUPPORTED_ENGINES.includes(config.engine)) {
+    throw new Error("engine must be docker or podman.");
+  }
+  if (config.engine === "podman" && config.accessMode === "host-root") {
+    throw new Error(
+      `Host-root access (--access host-root) is not supported on Podman because rootless user namespaces remap host UIDs. Use --access isolated or register specific folders with "${UNIVERSAL_COMMAND} workspace add <path>".`
+    );
   }
   if (typeof config.companionsEnabled !== "boolean") {
     throw new Error("companionsEnabled must be boolean.");
@@ -676,17 +726,30 @@ const CLI_SANDBOX_OPTIONS = ["    security_opt:", "      - seccomp=./seccomp-cli
 
 export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
   validateConfig(config);
+  const isPodman = resolveEngine(config) === "podman";
+  const podmanBindOpts = isPodman ? ["        bind:", "          selinux: z"] : [];
+  const podmanCliUserns = isPodman ? ['    userns_mode: "keep-id:uid=10001,gid=10001"'] : [];
   const mounts = config.workspaces.flatMap((workspace) => [
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...podmanBindOpts
   ]);
   const service = mounts.length > 0
     ? ["    volumes:", ...mounts]
     : ["    volumes: []"];
   if (config.users === undefined) {
-    return ["services:", "  spaceapp-core:", ...service, "  spaceapp-cli:", ...service, ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []), ""].join("\n");
+    return [
+      "services:",
+      "  spaceapp-core:",
+      ...service,
+      "  spaceapp-cli:",
+      ...podmanCliUserns,
+      ...service,
+      ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []),
+      ""
+    ].join("\n");
   }
   // "user enable": accounts are on, and the core starts a USER's CLIs only in that user's own container.
   const users = config.users;
@@ -695,19 +758,24 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...podmanBindOpts
   ];
   const userServices = users.flatMap((user) => {
     const slug = userSlug(user.id);
+    // keep-id needs gosu to switch from root to uid 10001; no-new-privileges refuses that switch.
+    const securityOpt = [
+      ...(isPodman ? [] : ["      - no-new-privileges:true"]),
+      ...(cliSandbox ? CLI_SANDBOX_OPTIONS.slice(1) : [])
+    ];
     return [
       `  spaceapp-cli-${slug}:`,
       // The owner's pinned CLI image (runtime.env sets the digest; 1.1.7 review: a moved tag cannot change a user's).
       "    image: ghcr.io/oll4com/spaceapp-cli:${SPACEAPP_IMAGE_TAG}${SPACEAPP_CLI_IMAGE_DIGEST:-}",
       "    restart: unless-stopped",
       "    init: true",
-      "    security_opt:",
-      "      - no-new-privileges:true",
-      ...(cliSandbox ? CLI_SANDBOX_OPTIONS.slice(1) : []),
+      ...podmanCliUserns,
+      ...(securityOpt.length > 0 ? ["    security_opt:", ...securityOpt] : []),
       `    mem_limit: "${user.memoryLimit ?? settings.cliMemoryLimit}"`,
       "    cpus: \"${SPACEAPP_CLI_CPU_LIMIT}\"",
       "    environment:",
@@ -737,6 +805,7 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      - ./cli-hosts.json:/etc/spaceapp/cli-hosts.json:ro",
     ...users.map((user) => `      - spaceapp-cli-socket-${userSlug(user.id)}:/run/spaceapp-cli-users/${userSlug(user.id)}`),
     "  spaceapp-cli:",
+    ...podmanCliUserns,
     ...service,
     ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []),
     ...userServices,
@@ -909,7 +978,8 @@ export function composeCommand(action, root, options = {}) {
   if (!selected) {
     throw new Error(`Unsupported Compose action "${action}".`);
   }
-  return { command: "docker", args: [...base, ...selected] };
+  const engine = resolveEngine(options);
+  return { command: engine, args: [...base, ...selected] };
 }
 
 export function composeProjectName(root) {
@@ -984,7 +1054,8 @@ export async function prepareInstallation(root, {
   version,
   profile,
   accessMode,
-  companionsEnabled
+  companionsEnabled,
+  engine
 }) {
   validateHome(root);
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -999,6 +1070,13 @@ export async function prepareInstallation(root, {
   let config;
   try {
     config = await loadConfig(root);
+    if (engine !== undefined && resolveEngine(engine) !== resolveEngine(config)) {
+      const currentEngine = resolveEngine(config);
+      const targetEngine = resolveEngine(engine);
+      throw new Error(
+        `Switching container engines on an existing installation (${currentEngine} -> ${targetEngine}) is refused because ${currentEngine} volumes are not visible to ${targetEngine}. Run "${UNIVERSAL_COMMAND} backup", then "${UNIVERSAL_COMMAND} uninstall --purge-data" (or set a new SPACEAPP_HOME), install with "--engine ${targetEngine}", and run "${UNIVERSAL_COMMAND} restore".`
+      );
+    }
   } catch (error) {
     if (error?.code !== "ENOENT") {
       throw error;
@@ -1007,7 +1085,8 @@ export async function prepareInstallation(root, {
       version,
       profile: resolvedProfile ?? "light",
       accessMode: resolveInstallAccessMode(accessMode),
-      companionsEnabled
+      companionsEnabled,
+      engine
     });
   }
   if (config.version !== version) {
@@ -1091,7 +1170,10 @@ export async function commitInstallation(root, config, {
 } = {}) {
   validateHome(root);
   validateConfig(config);
-  const composeTemplate = await readFile(join(templateDir, "compose.yml"), "utf8");
+  const composeTemplate = composeFileForEngine(
+    await readFile(join(templateDir, "compose.yml"), "utf8"),
+    config
+  );
   await mkdir(root, { recursive: true, mode: 0o700 });
   await atomicWrite(join(root, "compose.yml"), composeTemplate);
   await mkdir(projectRoot, { recursive: true, mode: 0o700 });

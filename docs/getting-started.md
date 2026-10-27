@@ -146,8 +146,26 @@ data, credentials, workspaces, secrets, and persistent volumes, run:
 npx --yes run-spaceapp@latest install --access isolated
 ```
 
-Host-root is supported only on Linux; the launcher refuses it on macOS and
-Windows.
+Host-root is supported only on Linux with Docker (`--engine docker`); the launcher refuses it on macOS, Windows, and rootless Podman (`--engine podman`).
+
+## Rootless Podman (`--engine podman`)
+
+SpaceApp supports rootless **Podman 5+** as a first-class container engine:
+
+```bash
+npx --yes run-spaceapp@latest install --engine podman
+```
+
+If Docker is not installed and a working Podman 5+ runtime with `podman compose` is already on `PATH`, `run-spaceapp install` offers to use Podman automatically. Passing `--engine podman` skips the Docker installation flow, verifies `podman --version` (5+), `podman compose version`, and `podman info`, and records `"engine": "podman"` in `config.json`.
+
+- **Podman 5+ requirement**: Podman 4.x is rejected with upgrade instructions. The supported Compose provider is `podman compose` from Podman 5 or newer, backed by Docker Compose v2 or `podman-compose`. Podman 4.x is not supported.
+- **Workspaces & SELinux**: Registered workspace bind mounts include `:z` SELinux shared labels. `spaceapp-cli` uses `userns_mode: "keep-id:uid=10001,gid=10001"` so container UID `10001` maps to your host user. The published images start as root and `gosu` down to that user, so the Podman CLI service is written without `no-new-privileges` (that option makes the switch fail with "operation not permitted"). Other services keep `no-new-privileges`.
+- **macOS**: `install --engine podman` checks the running Podman machine's CPU, memory, and disk against the selected profile and prints a `podman machine set` command when the machine is too small. Disk size is only increased.
+- **Windows**: Podman is not supported. Use Docker Desktop.
+- **`--answers`**: `"engine": "podman"` in the answers file selects Podman the same way `--engine podman` does. When Docker is missing, an interactive install asks before using Podman; `--non-interactive` selects it.
+- **`--access host-root` limitation**: `--access host-root` is refused when `--engine podman` is selected because rootless user namespaces remap host UIDs. Use `--access isolated` and `spaceapp workspace add <path>`.
+- **Engine migration**: Switching engines (`docker` ↔ `podman`) on an existing installation is refused so named-volume data is never silently orphaned. Run `spaceapp backup`, uninstall with `--purge-data` (or choose a new `SPACEAPP_HOME`), install with the other `--engine`, then run `spaceapp restore`.
+- **doctor**: Reports the engine, Podman version, rootless or rootful mode, cgroup version, and whether the `cpu` and `memory` controllers are delegated. `support-bundle` records the same facts and no secrets.
 
 The `npx` command is the universal one-command installer. To retain a global
 launcher for later operations, optionally run `npm install -g run-spaceapp`;

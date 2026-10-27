@@ -57,3 +57,37 @@ jobs:
       - run: npm run check -w run-spaceapp
       - run: npm run pack:dry-run -w run-spaceapp
       - run: node packages/run-spaceapp/bin/spaceapp.mjs --version
+
+  rootless-podman:
+    name: Rootless Podman (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.0"
+          cache: npm
+
+      - name: Install workspace dependencies on supported hosts
+        if: runner.arch != 'ARM64'
+        run: npm ci
+
+      - name: Install source workspace for the intentional x64 package rejection test
+        if: runner.arch == 'ARM64'
+        run: npm ci --force
+
+      - name: Probe the runner Podman and run the launcher suite
+        run: |
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+          podman --version
+          podman info --format 'rootless={{.Host.Security.Rootless}} version={{.Version.Version}} cgroup={{.Host.CgroupVersion}}' || true
+          node --test packages/run-spaceapp/tests/podman.test.mjs
+          npm test -w run-spaceapp
+          npm run check -w run-spaceapp
