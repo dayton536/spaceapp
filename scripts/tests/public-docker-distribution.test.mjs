@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { lstat, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -347,4 +347,244 @@ test("core seeds generic starter memory only when mutable owner memory is absent
   assert.doesNotMatch(core, /gemini_history|SPACE_GEMINI_MEMORY/);
   assert.match(starter, /^# SpaceApp Memory/m);
   assert.doesNotMatch(starter, /\/etc\/docs|\/srv\/space|spaceapp-user|oll4\.com/i);
+});
+
+test("Dockerfile stages per-service runtime trees instead of shipping the full monorepo in runtime-base", async () => {
+  const dockerfile = await readFile(join(root, "Dockerfile"), "utf8");
+  const stages = Object.fromEntries(
+    dockerfile.split(/^(?=FROM )/m).map((stage) => [stage.match(/^FROM \S+ AS (\S+)/)?.[1], stage])
+  );
+
+  assert.match(
+    stages.build,
+    /node deploy\/docker\/stage-container-runtime\.mjs --source \/app --output \/app-targets --arch "\$\{TARGETARCH:-\}"/
+  );
+  for (const forbidden of [
+    "COPY --from=build --chown=spaceapp:spaceapp /app/node_modules",
+    "COPY --from=build --chown=spaceapp:spaceapp /app/apps",
+    "COPY --from=build --chown=spaceapp:spaceapp /app/packages",
+    "COPY --from=build --chown=spaceapp:spaceapp /app/agent-skills"
+  ]) {
+    assert.equal(stages["runtime-base"].includes(forbidden), false, forbidden);
+  }
+  assert.match(stages.core, /COPY --from=build --chown=spaceapp:spaceapp \/app-targets\/core\/ \.\//);
+  assert.match(stages.browser, /COPY --from=build --chown=spaceapp:spaceapp \/app-targets\/browser\/ \.\//);
+  assert.match(stages.cli, /COPY --from=build --chown=spaceapp:spaceapp \/app-targets\/cli\/ \.\//);
+  assert.match(stages["runtime-base"], /useradd --uid 10001 --gid 10001/);
+  assert.match(stages.core, /ENTRYPOINT \["\/app\/deploy\/docker\/core-entrypoint\.sh"\]/);
+  assert.match(stages.browser, /ENTRYPOINT \["\/app\/deploy\/docker\/browser-entrypoint\.sh"\]/);
+  assert.match(stages.cli, /ENTRYPOINT \["\/app\/deploy\/docker\/cli-entrypoint\.sh"\]/);
+});
+
+test("core can import the CLI host client without shipping node-pty", async () => {
+  const spawnSource = await readFile(join(root, "packages/cli-host/src/node-pty-spawn.ts"), "utf8");
+  const apiManifest = JSON.parse(await readFile(join(root, "apps/api/package.json"), "utf8"));
+
+  assert.match(spawnSource, /createRequire\(import\.meta\.url\)/);
+  assert.match(spawnSource, /require\("node-pty"\)/);
+  assert.doesNotMatch(spawnSource, /^import\s+\{[^}]*\}\s+from\s+"node-pty"/m);
+  assert.equal(apiManifest.dependencies["node-pty"], undefined);
+});
+
+test("staged runtime trees keep only the modules and native builds each target runs", async () => {
+  const { stageAllContainerTargets } = await import(
+    pathToFileURL(join(root, "deploy/docker/stage-container-runtime.mjs")).href
+  );
+  const source = await mkdtemp(join(tmpdir(), "spaceapp-stage-src-"));
+  const output = await mkdtemp(join(tmpdir(), "spaceapp-stage-out-"));
+  const write = async (rel, contents) => {
+    await mkdir(join(source, dirname(rel)), { recursive: true });
+    await writeFile(join(source, rel), contents);
+  };
+  const pkg = (name, dependencies = {}, optionalDependencies = {}) =>
+    JSON.stringify({ name, version: "1.0.0", dependencies, optionalDependencies });
+
+  try {
+    await write("package.json", JSON.stringify({ name: "space", private: true }));
+    await write("package-lock.json", "{}\n");
+    await write("apps/api/package.json", pkg("@space/api", {
+      "@space/db": "0.2.5",
+      "@space/cli-host": "0.2.5",
+      nanoid: "1.0.0",
+      "node-pty": "1.1.0",
+      "@temporalio/client": "1.24.0",
+      "pdfjs-dist": "6.3.289"
+    }));
+    await write("apps/api/dist/browser-host-main.js", "import { helper } from \"./lib/helper.js\";\nimport \"@space/db\";\nimport \"nanoid\";\nexport const main = helper;\n");
+    await write("apps/api/dist/lib/helper.js", "export const helper = 1;\n");
+    await write("apps/api/dist/server.js", "import \"@temporalio/client\";\nimport \"pdfjs-dist/legacy/build/pdf.mjs\";\n");
+    await write("apps/web/package.json", pkg("@space/web"));
+    await write("apps/web/server.mjs", "export const web = 1;\n");
+    await write("apps/web/dist/index.html", "<p>web</p>\n");
+    await write("packages/db/package.json", pkg("@space/db", { pg: "8.0.0" }));
+    await write("packages/db/dist/index.js", "export const db = 1;\n");
+    await write("packages/db/dist/migrate.js", "export const migrate = 1;\n");
+    await write("packages/db/migrations/0001_initial.sql", "SELECT 1;\n");
+    await write("packages/cli-host/package.json", pkg("@space/cli-host", { "node-pty": "1.1.0" }));
+    await write("packages/cli-host/dist/main.js", "export const main = 1;\n");
+    await write("packages/cli-host/dist/index.d.ts", "export {};\n");
+    await write("agent-skills/demo/SKILL.md", "# demo\n");
+    await write("scripts/portable-backup.mjs", "export {};\n");
+    await write("scripts/reset-owner-password.mjs", "export {};\n");
+    for (const ws of [
+      "apps/worker", "packages/browser-host", "packages/codex-app-server", "packages/contracts",
+      "packages/gateway", "packages/memory-graph", "packages/opencode-control", "packages/runtime", "packages/streaming"
+    ]) {
+      await write(`${ws}/package.json`, pkg(`@space/${ws.split("/")[1]}`));
+      await write(`${ws}/dist/index.js`, "export {};\n");
+    }
+    await write("packages/gateway/grammars/tree-sitter-python.wasm", "wasm");
+    await write("packages/gateway/src/providers/local/space-local-embeddings.py", "print('ok')\n");
+    await write("node_modules/nanoid/package.json", pkg("nanoid"));
+    await write("node_modules/nanoid/index.js", "export const id = 1;\n");
+    await write("node_modules/pg/package.json", pkg("pg"));
+    await write("node_modules/pg/index.js", "export const pg = 1;\n");
+    await write("node_modules/pdfjs-dist/package.json", pkg("pdfjs-dist", {}, { "@napi-rs/canvas": "1.0.9" }));
+    await write("node_modules/pdfjs-dist/legacy/build/pdf.mjs", "export const pdf = 1;\n");
+    await write("node_modules/@napi-rs/canvas/package.json", pkg("@napi-rs/canvas", {}, {
+      "@napi-rs/canvas-linux-x64-gnu": "1.0.9",
+      "@napi-rs/canvas-linux-arm64-gnu": "1.0.9",
+      "@napi-rs/canvas-darwin-arm64": "1.0.9",
+      "@napi-rs/canvas-linux-x64-musl": "1.0.9"
+    }));
+    await write("node_modules/@napi-rs/canvas/index.js", "export {};\n");
+    await write("node_modules/@napi-rs/canvas-linux-x64-gnu/package.json", pkg("@napi-rs/canvas-linux-x64-gnu"));
+    await write("node_modules/@napi-rs/canvas-linux-x64-gnu/skia.linux-x64-gnu.node", "linux-x64");
+    await write("node_modules/@napi-rs/canvas-linux-arm64-gnu/package.json", pkg("@napi-rs/canvas-linux-arm64-gnu"));
+    await write("node_modules/@napi-rs/canvas-linux-arm64-gnu/skia.linux-arm64-gnu.node", "linux-arm64");
+    await write("node_modules/@napi-rs/canvas-darwin-arm64/package.json", pkg("@napi-rs/canvas-darwin-arm64"));
+    await write("node_modules/@napi-rs/canvas-darwin-arm64/skia.node", "darwin");
+    await write("node_modules/@napi-rs/canvas-linux-x64-musl/package.json", pkg("@napi-rs/canvas-linux-x64-musl"));
+    await write("node_modules/@napi-rs/canvas-linux-x64-musl/skia.node", "musl");
+    await write("node_modules/@temporalio/client/package.json", pkg("@temporalio/client", { "@temporalio/core-bridge": "1.24.0" }));
+    await write("node_modules/@temporalio/client/index.js", "export {};\n");
+    await write("node_modules/@temporalio/core-bridge/package.json", pkg("@temporalio/core-bridge"));
+    await write("node_modules/@temporalio/core-bridge/releases/x86_64-unknown-linux-gnu/bridge.node", "amd64");
+    await write("node_modules/@temporalio/core-bridge/releases/aarch64-unknown-linux-gnu/bridge.node", "arm64");
+    await write("node_modules/@temporalio/core-bridge/releases/x86_64-apple-darwin/bridge.node", "darwin");
+    await write("node_modules/@temporalio/core-bridge/sdk-core/lib.rs", "fn main() {}\n");
+    await write("node_modules/node-pty/package.json", pkg("node-pty", { "node-addon-api": "7.0.0" }));
+    await write("node_modules/node-pty/lib/index.js", "exports.spawn = () => {};\n");
+    await write("node_modules/node-pty/lib/index.js.map", "map");
+    await write("node_modules/node-pty/build/Release/pty.node", "pty");
+    await write("node_modules/node-pty/build/Release/spawn-helper", "helper");
+    await write("node_modules/node-pty/prebuilds/linux-x64/pty.node", "linux-x64");
+    await write("node_modules/node-pty/prebuilds/linux-arm64/pty.node", "linux-arm64");
+    await write("node_modules/node-pty/prebuilds/darwin-arm64/pty.node", "darwin");
+    await write("node_modules/node-pty/third_party/conpty/OpenConsole.exe", "conpty");
+    await write("node_modules/node-addon-api/package.json", pkg("node-addon-api"));
+    await write("node_modules/node-addon-api/index.js", "exports.ok = 1;\n");
+
+    assert.throws(
+      () => stageAllContainerTargets({ sourceRoot: source, outputRoot: join(source, "inside"), arch: "amd64" }),
+      /inside source/
+    );
+
+    stageAllContainerTargets({ sourceRoot: source, outputRoot: output, arch: "amd64" });
+    const core = join(output, "core");
+    const browser = join(output, "browser");
+    const cli = join(output, "cli");
+    const present = (path) => readFile(path, "utf8");
+    const absent = async (path) => {
+      await assert.rejects(readFile(path, "utf8"), { code: "ENOENT" });
+    };
+
+    await present(join(core, "packages/db/migrations/0001_initial.sql"));
+    await present(join(core, "packages/db/dist/migrate.js"));
+    await present(join(core, "apps/api/dist/server.js"));
+    await present(join(core, "apps/web/server.mjs"));
+    await present(join(core, "apps/web/dist/index.html"));
+    await present(join(core, "scripts/portable-backup.mjs"));
+    await present(join(core, "scripts/reset-owner-password.mjs"));
+    await present(join(core, "agent-skills/demo/SKILL.md"));
+    await present(join(core, "packages/gateway/grammars/tree-sitter-python.wasm"));
+    await present(join(core, "packages/gateway/src/providers/local/space-local-embeddings.py"));
+    await present(join(core, "node_modules/@temporalio/core-bridge/releases/x86_64-unknown-linux-gnu/bridge.node"));
+    await present(join(core, "node_modules/@napi-rs/canvas-linux-x64-gnu/skia.linux-x64-gnu.node"));
+    await present(join(core, "node_modules/pdfjs-dist/legacy/build/pdf.mjs"));
+    await absent(join(core, "node_modules/node-pty/lib/index.js"));
+    await absent(join(core, "node_modules/@temporalio/core-bridge/releases/aarch64-unknown-linux-gnu/bridge.node"));
+    await absent(join(core, "node_modules/@temporalio/core-bridge/releases/x86_64-apple-darwin/bridge.node"));
+    await absent(join(core, "node_modules/@temporalio/core-bridge/sdk-core/lib.rs"));
+    await absent(join(core, "node_modules/@napi-rs/canvas-linux-arm64-gnu/skia.linux-arm64-gnu.node"));
+    await absent(join(core, "node_modules/@napi-rs/canvas-darwin-arm64/skia.node"));
+    await absent(join(core, "node_modules/@napi-rs/canvas-linux-x64-musl/skia.node"));
+    assert.match(await readlink(join(core, "node_modules/@space/db")), /\.\.\/\.\.\/packages\/db$/);
+
+    await present(join(browser, "apps/api/dist/browser-host-main.js"));
+    await present(join(browser, "apps/api/dist/lib/helper.js"));
+    await present(join(browser, "node_modules/nanoid/index.js"));
+    await present(join(browser, "node_modules/pg/index.js"));
+    await present(join(browser, "packages/db/migrations/0001_initial.sql"));
+    await absent(join(browser, "apps/api/dist/server.js"));
+    await absent(join(browser, "node_modules/@temporalio/client/index.js"));
+    await absent(join(browser, "node_modules/pdfjs-dist/legacy/build/pdf.mjs"));
+    await absent(join(browser, "node_modules/node-pty/lib/index.js"));
+    await absent(join(browser, "apps/web/server.mjs"));
+
+    await present(join(cli, "packages/cli-host/dist/main.js"));
+    await present(join(cli, "node_modules/node-pty/build/Release/pty.node"));
+    await present(join(cli, "node_modules/node-pty/build/Release/spawn-helper"));
+    await present(join(cli, "node_modules/node-pty/prebuilds/linux-x64/pty.node"));
+    await present(join(cli, "node_modules/node-pty/lib/index.js"));
+    await present(join(cli, "node_modules/node-addon-api/index.js"));
+    await present(join(cli, "agent-skills/demo/SKILL.md"));
+    await absent(join(cli, "packages/cli-host/dist/index.d.ts"));
+    await absent(join(cli, "node_modules/node-pty/lib/index.js.map"));
+    await absent(join(cli, "node_modules/node-pty/prebuilds/linux-arm64/pty.node"));
+    await absent(join(cli, "node_modules/node-pty/prebuilds/darwin-arm64/pty.node"));
+    await absent(join(cli, "node_modules/node-pty/third_party/conpty/OpenConsole.exe"));
+    await absent(join(cli, "apps/api/dist/server.js"));
+    await absent(join(cli, "node_modules/@temporalio/client/index.js"));
+  } finally {
+    await rm(source, { recursive: true, force: true });
+    await rm(output, { recursive: true, force: true });
+  }
+});
+
+test("container smoke plans follow each image entrypoint", async () => {
+  const { buildSmokePlan, parseSmokeArgs, runContainerSmoke, CLI_HOST_SOCKET, BROWSER_HOST_SOCKET, CHROMIUM_PROBE } = await import(
+    pathToFileURL(join(root, "deploy/docker/smoke-container-image.mjs")).href
+  );
+
+  assert.deepEqual(
+    parseSmokeArgs(["--target", "core", "--image", "spaceapp-ci:core-amd64", "--arch", "amd64"]),
+    { target: "core", image: "spaceapp-ci:core-amd64", arch: "amd64" }
+  );
+  assert.throws(() => parseSmokeArgs(["--target", "desktop", "--image", "x"]), /Unsupported container target/);
+
+  const corePlan = buildSmokePlan({ target: "core", image: "spaceapp-ci:core-amd64", arch: "amd64", runId: "t1", secretDir: "/secrets" });
+  assert.equal(corePlan.requiresPostgres, true);
+  assert.equal(corePlan.migrateArgs, null);
+  assert.match(corePlan.readinessProbe, /http:\/\/127\.0\.0\.1:4911\/readyz/);
+  assert.equal(corePlan.containerEnv.SPACE_RUNTIME_STORE, "postgres");
+  assert.equal(corePlan.containerEnv.SPACEAPP_WORKFLOWS_ENABLED, "false");
+  assert.ok(corePlan.secretMounts.some((mount) => mount.startsWith("/secrets/database-url:/run/secrets/database-url")));
+  assert.ok(corePlan.secretMounts.some((mount) => mount.includes("/run/secrets/setup-token")));
+  assert.equal(corePlan.runArgs.at(-1), "spaceapp-ci:core-amd64");
+
+  const cliPlan = buildSmokePlan({ target: "cli", image: "spaceapp-ci:cli-arm64", arch: "arm64", runId: "t2" });
+  assert.equal(cliPlan.requiresPostgres, false);
+  assert.equal(cliPlan.containerEnv.SPACE_CLI_HOST_SOCKET, CLI_HOST_SOCKET);
+  assert.match(cliPlan.socketProbe, /\/run\/spaceapp-cli\/host\.sock/);
+  assert.equal(cliPlan.runArgs.at(-1), "spaceapp-ci:cli-arm64");
+
+  const browserPlan = buildSmokePlan({ target: "browser", image: "spaceapp-ci:browser-amd64", arch: "amd64", runId: "t3", secretDir: "/secrets" });
+  assert.equal(browserPlan.requiresPostgres, true);
+  assert.equal(browserPlan.containerEnv.SPACE_BROWSER_HOST_SOCKET, BROWSER_HOST_SOCKET);
+  assert.ok(browserPlan.migrateArgs.includes("packages/db/dist/migrate.js"));
+  assert.deepEqual(browserPlan.chromiumProbe, CHROMIUM_PROBE);
+
+  const calls = [];
+  const result = await runContainerSmoke(
+    { target: "cli", image: "spaceapp-ci:cli-amd64", arch: "amd64" },
+    async (cmd, args) => {
+      calls.push([cmd, ...args]);
+      return { stdout: "running\n", stderr: "" };
+    }
+  );
+  assert.equal(result.ok, true);
+  assert.ok(calls.some((call) => call[1] === "run" && call.includes("spaceapp-ci:cli-amd64")));
+  assert.ok(calls.some((call) => call.includes(`SPACE_CLI_HOST_SOCKET=${CLI_HOST_SOCKET}`)));
+  assert.ok(calls.some((call) => call[1] === "exec" && call.includes("node")));
 });
