@@ -5,6 +5,10 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Container images
+
+- `spaceapp-core`, `spaceapp-browser`, and `spaceapp-cli` each ship only the workspaces and production dependencies that service runs. Image size budgets are 850 MiB (core), 1350 MiB (browser), and 1000 MiB (cli).
+
 ## [1.1.8] - 2026-10-25
 
 Source: sanitized Space app @ 8d5bf21b32 (4948 files). Verifies SpaceApp's image attestations before an

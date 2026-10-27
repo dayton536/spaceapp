@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "sourceCommit": "8d5bf21b3228e5ea89557ab56b6a3bee352fc5a5",
   "fileCount": 4948,
-  "transformations": 421,
+  "transformations": 423,
   "files": [
     {
       "path": ".gitignore",
@@ -8570,8 +8570,8 @@
     {
       "path": "apps/api/package.json",
       "sourceObjectId": "676dcd5165796b77548b01df98301f12c6cd6e1d",
-      "sha256": "045fd6412a7f53b0a652ecb12508038b030ef0b69fdcc1413502129852bd41fa",
-      "size": 2078
+      "sha256": "f2f1c41903427c10315a65ecc39514dfe777febf3c8899ed9dc3273a7f75db5f",
+      "size": 2052
     },
     {
       "path": "apps/api/src/__tests__/activity-log.test.ts",
@@ -23540,8 +23540,8 @@
     {
       "path": "package-lock.json",
       "sourceObjectId": "bebd5dbb1bc020651af5b6b60e61823bae5fad6b",
-      "sha256": "2bc219913dd6fe9003169bdc3881b33f25f939510b47f58e7c26c2af85124617",
-      "size": 419142
+      "sha256": "d4d2886596cfa962df4ab63835910b3aafceae39a9962140a504876cafcb1db4",
+      "size": 419112
     },
     {
       "path": "package.json",
@@ -23648,8 +23648,8 @@
     {
       "path": "packages/cli-host/src/node-pty-spawn.ts",
       "sourceObjectId": "47f18bfadd5b4ce8afd1da7c166362e8fcc94640",
-      "sha256": "9040fe7bd0fc4fd6554f071fdf918b3d3600de59607c123fa5546b3c99fd96f6",
-      "size": 726
+      "sha256": "697222c207b1610c6e391aee9a01b5e96909c4235459f73de12e6d3a9322987f",
+      "size": 1205
     },
     {
       "path": "packages/cli-host/src/server.ts",
