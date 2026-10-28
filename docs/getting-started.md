@@ -164,7 +164,9 @@ If Docker is not installed and a working Podman 5+ runtime with `podman compose`
 - **Windows**: Podman is not supported. Use Docker Desktop.
 - **`--answers`**: `"engine": "podman"` in the answers file selects Podman the same way `--engine podman` does. When Docker is missing, an interactive install asks before using Podman; `--non-interactive` selects it.
 - **`--access host-root` limitation**: `--access host-root` is refused when `--engine podman` is selected because rootless user namespaces remap host UIDs. Use `--access isolated` and `spaceapp workspace add <path>`.
-- **Engine migration**: Switching engines (`docker` ↔ `podman`) on an existing installation is refused so named-volume data is never silently orphaned. Run `spaceapp backup`, uninstall with `--purge-data` (or choose a new `SPACEAPP_HOME`), install with the other `--engine`, then run `spaceapp restore`.
+- **Engine migration**: Switching engines (`docker` ↔ `podman`) on an existing installation is refused so named-volume data is never silently orphaned. `uninstall --purge-data` removes that engine's containers and data volumes, but it leaves `config.json` and `backups/` in the installation root. Installing again in that same root still reads the old `engine` from `config.json`. A new `SPACEAPP_HOME` does not see backups that stayed in the old root.
+  - Same root: run `spaceapp backup`, then `spaceapp uninstall --purge-data` (type `DELETE` when asked). Remove `$SPACEAPP_HOME/config.json` and leave `$SPACEAPP_HOME/backups/` in place. Run `spaceapp install --engine <new-engine>`, then `spaceapp restore`.
+  - New root: run `spaceapp backup`. Copy or move the backup directory from the old `$SPACEAPP_HOME/backups/<backup-id>` into the new `$SPACEAPP_HOME/backups/<backup-id>`. Then run `spaceapp install --engine <new-engine>` and `spaceapp restore` with `SPACEAPP_HOME` set to the new root.
 - **doctor**: Reports the engine, Podman version, rootless or rootful mode, cgroup version, and whether the `cpu` and `memory` controllers are delegated. `support-bundle` records the same facts and no secrets.
 
 The `npx` command is the universal one-command installer. To retain a global

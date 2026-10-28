@@ -120,6 +120,7 @@ export async function prepareDockerCliPath({
   return directory;
 }
 
+/** Installs Docker when it is missing, or uses Podman 5 when that engine was requested or accepted. */
 export async function ensureDockerAvailable({
   platform = process.platform,
   arch = process.arch,
@@ -656,6 +657,7 @@ async function confirmWindowsRestart({ stdin, stdout, question }) {
   return confirmQuestion({ stdin, stdout, question });
 }
 
+/** Asks a yes/no question. An empty answer uses defaultYes. */
 async function confirmQuestion({ stdin, stdout, question, defaultYes = false }) {
   const readline = createInterface({ input: stdin, output: stdout, terminal: Boolean(stdin?.isTTY) });
   try {
@@ -694,6 +696,7 @@ async function dockerIsReady(execute) {
   return true;
 }
 
+/** Runs one command and returns its exit code plus trimmed output. Probes time out after 15 seconds unless timeoutMs is set. */
 async function captureExecuteOutput(execute, spec) {
   let streamText = "";
   let callbackText = "";
@@ -714,6 +717,7 @@ async function captureExecuteOutput(execute, spec) {
     const code = await execute(
       {
         ...spec,
+        timeoutMs: spec.timeoutMs ?? 15000,
         onStdout(chunk) {
           if (callbackText.length < 1024 * 1024) callbackText += String(chunk);
         },
@@ -730,6 +734,7 @@ async function captureExecuteOutput(execute, spec) {
   }
 }
 
+/** Major version from `podman --version` or the Version field of `podman info`, or null. */
 export function parsePodmanMajorVersion(versionText, infoVersion = null) {
   const raw = String(infoVersion || versionText || "").trim();
   const match = /(?:podman\s+version\s+|^)(\d+)\.(\d+)\.(\d+)/i.exec(raw);
@@ -738,6 +743,7 @@ export function parsePodmanMajorVersion(versionText, infoVersion = null) {
 
 // `podman machine set` takes memory in MiB and disk in GiB. `machine inspect` reports those
 // small units on some versions and raw bytes on others. A value below 1 MiB is the set-command unit.
+/** Converts a Podman machine memory or disk value to bytes. Values under 1 MiB are the set-command unit. */
 function podmanQuantityToBytes(value, smallUnit) {
   const amount = Number(value);
   if (!Number.isFinite(amount) || amount <= 0) return null;
@@ -746,6 +752,7 @@ function podmanQuantityToBytes(value, smallUnit) {
   return Math.round(amount * unit);
 }
 
+/** CPU, memory, and disk from `podman machine inspect`, accepting bytes or set-command units. */
 export function podmanMachineResources(inspectValue) {
   const machine = Array.isArray(inspectValue) ? inspectValue[0] : inspectValue;
   const resources = machine?.Resources ?? machine?.resources ?? {};
@@ -758,6 +765,7 @@ export function podmanMachineResources(inspectValue) {
   };
 }
 
+/** Formats a byte count as GiB with one decimal place. */
 function formatMachineGib(bytes) {
   return (Math.round((bytes / 1024 ** 3) * 10) / 10).toFixed(1);
 }
@@ -787,6 +795,7 @@ export function podmanMachineResizeAdvice(resources, profile = "small") {
   return `Podman machine is too small for the ${resolvedProfile} profile (${gaps.join("; ")}). Resize it without shrinking the disk: ${resize}`;
 }
 
+/** How to install Podman 5 and a Compose provider on this platform. */
 export function podmanInstallInstructions(platform = process.platform) {
   if (platform === "darwin") {
     return "Install Podman 5+ and Compose on macOS with: brew install podman podman-compose && podman machine init --cpus 4 --memory 8192 --disk-size 30 && podman machine start";
@@ -797,6 +806,7 @@ export function podmanInstallInstructions(platform = process.platform) {
   return "Install Podman 5+ and its Compose provider on Linux (for example: sudo dnf install -y podman podman-compose, or sudo apt-get install -y podman podman-compose).";
 }
 
+/** Probes the Podman CLI, Compose provider, and `podman info` without installing anything. */
 export async function detectPodmanStatus({ execute }) {
   const versionRes = await captureExecuteOutput(execute, { command: "podman", args: ["--version"] });
   if (versionRes.code !== 0) {
@@ -861,6 +871,7 @@ export async function detectPodmanStatus({ execute }) {
   };
 }
 
+/** Rejects Windows, Podman older than 5, a missing Compose provider, and an undersized macOS machine. */
 export async function ensurePodmanAvailable({
   platform = process.platform,
   stdout = process.stdout,

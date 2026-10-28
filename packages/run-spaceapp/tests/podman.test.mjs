@@ -15,6 +15,7 @@ import {
   validateConfig
 } from "../src/index.mjs";
 import {
+  detectPodmanStatus,
   ensureDockerAvailable,
   ensurePodmanAvailable,
   parsePodmanMajorVersion,
@@ -83,6 +84,21 @@ function createPodmanInfoJson({
     }
   });
 }
+
+test("detectPodmanStatus gives every probe a bounded timeout", async () => {
+  const timeouts = [];
+  await detectPodmanStatus({
+    execute: async (spec) => {
+      timeouts.push(spec.timeoutMs);
+      if (spec.args?.[0] === "--version") {
+        spec.onStdout?.("podman version 5.3.1\n");
+        return 0;
+      }
+      return 1;
+    }
+  });
+  assert.deepEqual(timeouts, [15000, 15000, 15000]);
+});
 
 test("parsePodmanMajorVersion extracts major version and ensurePodmanAvailable rejects Podman 4.x", async () => {
   assert.equal(parsePodmanMajorVersion("podman version 5.3.1"), 5);

@@ -80,14 +80,119 @@ jobs:
         if: runner.arch == 'ARM64'
         run: npm ci --force
 
-      - name: Probe the runner Podman and run the launcher suite
+      - name: Install Podman 5, verify rootless mode, and run the launcher suite
         run: |
-          if ! command -v podman >/dev/null 2>&1; then
+          set -euo pipefail
+          # Ubuntu 24.04 apt still ships Podman 4.9.3. Podman 5+ comes from the pinned
+          # static bundle GitHub runner images use (mgoltzsche/podman-static v5.8.4).
+          # Ubuntu 26.04 apt already provides Podman 5, so that package is kept.
+          podman_major() {
+            podman --version | sed -nE 's/.* ([0-9]+)\..*/\1/p'
+          }
+          ensure_rootless_ids() {
             sudo apt-get update
-            sudo apt-get install -y podman
+            sudo apt-get install -y uidmap
+            local user
+            user="$(id -un)"
+            if ! grep -q "^${user}:" /etc/subuid; then
+              echo "${user}:100000:65536" | sudo tee -a /etc/subuid >/dev/null
+            fi
+            if ! grep -q "^${user}:" /etc/subgid; then
+              echo "${user}:100000:65536" | sudo tee -a /etc/subgid >/dev/null
+            fi
+            if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR}" ]]; then
+              export XDG_RUNTIME_DIR="/tmp/spaceapp-podman-$(id -u)"
+              mkdir -p "${XDG_RUNTIME_DIR}"
+              chmod 700 "${XDG_RUNTIME_DIR}"
+            fi
+          }
+          install_podman5_static() {
+            local arch checksum archive
+            case "$(uname -m)" in
+              x86_64) arch="amd64"; checksum="a58765fe8be6ab3fb79f892f1a027b4ce4a7e8eb589df1ef960c167cbde08d69" ;;
+              aarch64|arm64) arch="arm64"; checksum="a2f6b73cc0f7018e2e8518338a4ec27db70148e1af86e16719235605aefd1df3" ;;
+              *) echo "Unsupported architecture for the Podman 5 static bundle: $(uname -m)" >&2; exit 1 ;;
+            esac
+            archive="/tmp/podman-linux-${arch}.tar.gz"
+            curl -fsSL -o "${archive}" "https://github.com/mgoltzsche/podman-static/releases/download/v5.8.4/podman-linux-${arch}.tar.gz"
+            echo "${checksum}  ${archive}" | sha256sum -c -
+            sudo tar -xzf "${archive}" -C / --strip-components=1 \
+              "podman-linux-${arch}/usr" "podman-linux-${arch}/etc"
+            rm -f "${archive}"
+            if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] && [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" == "1" ]]; then
+              sudo apt-get install -y apparmor
+              sudo tee /etc/apparmor.d/podman >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile podman /usr/{bin,local/bin}/podman flags=(unconfined) {
+            userns,
+
+            include if exists <local/podman>
+          }
+          EOF
+              sudo apparmor_parser -r -W /etc/apparmor.d/podman
+            fi
+            hash -r
+          }
+          ensure_compose_provider() {
+            if podman compose version; then
+              return 0
+            fi
+            sudo apt-get install -y docker-compose-v2
+            if [[ ! -x /usr/local/bin/docker-compose && -x /usr/libexec/docker/cli-plugins/docker-compose ]]; then
+              sudo ln -s /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+            fi
+            if podman compose version; then
+              return 0
+            fi
+            docker-compose version
+          }
+          ensure_rootless_ids
+          major=""
+          if command -v podman >/dev/null 2>&1; then
+            major="$(podman_major)"
           fi
-          podman --version
-          podman info --format 'rootless={{.Host.Security.Rootless}} version={{.Version.Version}} cgroup={{.Host.CgroupVersion}}' || true
+          if [[ -z "${major}" || "${major}" -lt 5 ]]; then
+            install_podman5_static
+          fi
+          version="$(podman --version)"
+          echo "${version}"
+          major="$(podman_major)"
+          if [[ -z "${major}" || "${major}" -lt 5 ]]; then
+            echo "Podman 5 or newer is required; found: ${version}" >&2
+            exit 1
+          fi
+          info_json="${RUNNER_TEMP}/podman-info.json"
+          podman info --format json > "${info_json}"
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const info = JSON.parse(readFileSync(process.argv[1], "utf8"));
+            const rootless = info?.host?.security?.rootless;
+            if (rootless !== true) {
+              console.error("podman info did not report rootless mode");
+              process.exit(1);
+            }
+            const reported = String(info?.version?.Version ?? "");
+            const match = /^(\d+)\./.exec(reported);
+            if (!match || Number(match[1]) < 5) {
+              console.error(`podman info version is not Podman 5+: ${reported || "missing"}`);
+              process.exit(1);
+            }
+            console.log(`podman info: version=${reported} rootless=true`);
+          ' "${info_json}"
+          ensure_compose_provider
+          podman run --rm --network=none quay.io/podman/hello
+          node --input-type=module <<'EOF'
+          import { executeCommand } from "./packages/run-spaceapp/src/cli.mjs";
+          import { detectPodmanStatus } from "./packages/run-spaceapp/src/prerequisites.mjs";
+          const status = await detectPodmanStatus({ execute: executeCommand });
+          if (!status.ready || status.majorVersion < 5 || status.rootless !== true || !status.composeAvailable) {
+            console.error(JSON.stringify(status, null, 2));
+            process.exit(1);
+          }
+          console.log(`launcher podman smoke: ${status.version} rootless=${status.rootless} compose=${status.composeAvailable}`);
+          EOF
           node --test packages/run-spaceapp/tests/podman.test.mjs
           npm test -w run-spaceapp
           npm run check -w run-spaceapp

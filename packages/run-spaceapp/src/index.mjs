@@ -199,6 +199,7 @@ export function resolveInstallAccessMode(requestedMode, existingMode = "isolated
   throw new Error("Install access mode must be isolated or host-root.");
 }
 
+/** Returns docker or podman. A missing engine is docker. */
 export function resolveEngine(configOrEngine = "docker") {
   const candidate = typeof configOrEngine === "string"
     ? configOrEngine
@@ -219,6 +220,7 @@ const PODMAN_CLI_NNP_BLOCK = [
   ""
 ].join("\n");
 
+/** Drops no-new-privileges from spaceapp-cli for Podman. CRLF templates stay CRLF. */
 export function composeFileForEngine(template, engine = "docker") {
   if (typeof template !== "string") throw new Error("Compose template must be text.");
   if (resolveEngine(engine) !== "podman") return template;
@@ -345,6 +347,7 @@ export function installResourceChecks(resources, profile = "small", { requiredDi
   ];
 }
 
+/** Builds config.json for a new installation. The engine field is written only for Podman. */
 export function createDefaultConfig({
   version,
   profile = "light",
@@ -379,6 +382,7 @@ export function createDefaultConfig({
   };
 }
 
+/** Rejects an unknown engine and host-root access on Podman. */
 export function validateConfig(config) {
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     throw new Error("SpaceApp config must be an object.");
@@ -728,6 +732,7 @@ export async function userNamespacesUsable(platform = process.platform, read = (
 // mounts). Only where the sandbox can run: elsewhere it would widen the container for nothing.
 const CLI_SANDBOX_OPTIONS = ["    security_opt:", "      - seccomp=./seccomp-cli.json", "      - apparmor=unconfined"];
 
+/** Renders workspace bind mounts. Podman adds SELinux :z and keep-id on CLI services. */
 export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
   validateConfig(config);
   const isPodman = resolveEngine(config) === "podman";
@@ -857,6 +862,7 @@ export function renderHostAccessCompose(config) {
   ].join("\n");
 }
 
+/** Builds a docker or podman compose invocation. The engine defaults to docker. */
 export function composeCommand(action, root, options = {}) {
   validateHome(root);
   const stateRoot = options.stateRoot ?? root;
@@ -1054,6 +1060,7 @@ export async function writeRuntimeFiles(root, config, imageLock = PACKAGE_IMAGE_
   await atomicWrite(join(root, "compose.host-access.yml"), renderHostAccessCompose(config));
 }
 
+/** Prepares a home and refuses an in-place engine switch. */
 export async function prepareInstallation(root, {
   version,
   profile,
@@ -1166,6 +1173,7 @@ export async function prepareInstallation(root, {
   return { config, setupToken };
 }
 
+/** Writes compose files for the selected engine and records the installation. */
 export async function commitInstallation(root, config, {
   templateDir = defaultTemplateDir(),
   persistConfig = true,

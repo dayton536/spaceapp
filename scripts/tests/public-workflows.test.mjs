@@ -46,6 +46,12 @@ test("launcher and container matrices cover the declared operating systems and a
   );
   assert.match(platform, /- os: windows-latest\s+node: "24"/);
   assert.equal([...platform.matchAll(/- os: windows-latest/g)].length, 2);
+  assert.match(platform, /podman info --format json/);
+  assert.match(platform, /Podman 5 or newer is required/);
+  assert.match(platform, /podman compose version/);
+  assert.match(platform, /docker-compose version/);
+  assert.match(platform, /quay\.io\/podman\/hello/);
+  assert.doesNotMatch(platform, /\|\| true/);
   for (const target of ["core", "browser", "cli"]) {
     assert.match(containers, new RegExp(`- ${target}`));
   }

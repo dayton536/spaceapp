@@ -4,7 +4,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { verifyExportProvenance } from "../verify-export-provenance.mjs";
+import { verifyExportProvenance, writeExportProvenance } from "../verify-export-provenance.mjs";
 
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 const blob = (text) => createHash("sha1").update(`blob ${Buffer.byteLength(text)}\0${text}`).digest("hex");
@@ -24,4 +24,19 @@ test("separates unchanged and sanitized files and reports any file that differs 
   assert.equal(result.unchanged, 1);
   assert.deepEqual(result.sanitized, ["clean.txt"]);
   assert.deepEqual(result.problems, ["differs from the manifest: edited.txt"]);
+});
+
+test("write mode records the new bytes and counts the edited file as sanitized", async () => {
+  const root = await mkdtemp(join(tmpdir(), "spaceapp-provenance-write-"));
+  await writeFile(join(root, "edited.txt"), "edited after export\n");
+  const files = [
+    { path: "edited.txt", sourceObjectId: blob("original\n"), sha256: sha256("original\n"), size: 9 }
+  ];
+  await writeFile(join(root, "PUBLIC_EXPORT_MANIFEST.json"), JSON.stringify({ sourceCommit: "a".repeat(40), transformations: 0, files }));
+  const written = await writeExportProvenance(root);
+  assert.deepEqual(written.updated, ["edited.txt"]);
+  assert.equal(written.transformations, 1);
+  const result = await verifyExportProvenance(root);
+  assert.deepEqual(result.problems, []);
+  assert.deepEqual(result.sanitized, ["edited.txt"]);
 });

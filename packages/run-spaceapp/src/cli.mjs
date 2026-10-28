@@ -113,6 +113,7 @@ export function writeWindowsCredentialHint(platform, stderr) {
   );
 }
 
+/** Runs a compose command. Podman and non-Windows hosts skip the empty Docker config used for headless pulls. */
 export async function withHeadlessDockerConfig(platform, spec, run) {
   if (platform !== "win32" || spec?.command === "podman") {
     return run(spec);
@@ -273,6 +274,7 @@ async function writeRunOnceContinuation(root, { runtimeVersion, actions }) {
   await writeFile(runOnceContinuationPath(root), `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
 }
 
+/** Dispatches a launcher command and threads the container engine through lifecycle actions. */
 export async function run(argv, {
   env = process.env,
   platform = process.platform,
@@ -661,6 +663,7 @@ export async function run(argv, {
   throw new Error(`Unknown command "${command}". Run "${UNIVERSAL_COMMAND} help".`);
 }
 
+/** Installs SpaceApp. Switching engines on an existing home is refused. */
 async function installCommand(args, {
   root,
   launcherVersion,
@@ -1101,6 +1104,7 @@ async function installCommand(args, {
   }
 }
 
+/** Removes Compose services the selected profile no longer runs. */
 async function removeInactiveProfileServices({root, config, stateRoot = root, execute, stdin, stdout, stderr}) {
   const settings = profileRuntimeSettings(config.profile);
   for (const [enabled, action, profile] of [
@@ -1117,6 +1121,7 @@ async function removeInactiveProfileServices({root, config, stateRoot = root, ex
   return 0;
 }
 
+/** Collects install answers, including the engine from --engine or --answers. */
 async function planInteractiveSetup({
   args,
   root,
@@ -1331,6 +1336,7 @@ async function planInteractiveSetup({
   };
 }
 
+/** True when install asks for a profile, access mode, or engine the current config does not have. */
 function hasRequestedConfigChange(rawExisting, parsed) {
   if (!rawExisting) {
     return false;
@@ -1387,6 +1393,7 @@ async function offerUnattendedContinuation(root, runtimeVersion, stdin, stdout, 
   }
 }
 
+/** Recreates the runtime with the installation's resolved engine. */
 async function repairRuntime({ root, config, platform, stdin, stdout, stderr, execute, request, sleep, dryRun = false, ensureDocker = ensureDockerAvailable, env = process.env, arch = process.arch, inspectResources = inspectSystemResources }) {
   const raw = await readRawConfig(root);
   const plan = planConfigRepairs(raw);
@@ -1400,9 +1407,10 @@ async function repairRuntime({ root, config, platform, stdin, stdout, stderr, ex
     "Repair configuration and recreate the current runtime without deleting data.",
     ...plan.actions.map((action) => action.detail)
   ])) return 1;
+  const engine = resolveEngine(repaired);
   const prerequisites = await ensureDocker({platform, arch, env, stdin, stdout, stderr, execute, sleep: sleep || wait,
-    installArgs: {root,requestedProfile:repaired.profile,requestedAccessMode:repaired.accessMode,requestedEngine:repaired.engine,noOpen:true,autoConfirm:true},
-    ...(repaired.engine ? { engine: repaired.engine } : {})});
+    installArgs: {root,requestedProfile:repaired.profile,requestedAccessMode:repaired.accessMode,requestedEngine:engine,noOpen:true,autoConfirm:true},
+    engine});
   if(prerequisites.reexecuted || prerequisites.code !== 0) return prerequisites.code;
   config = repaired;
   if (await verifyStorage({ root, config, existingConfig: config, operation: "repair", inspectResources, execute, stdout, stderr }) !== 0) return 1;
@@ -1410,7 +1418,7 @@ async function repairRuntime({ root, config, platform, stdin, stdout, stderr, ex
   await writeRuntimeFiles(root, config);
   const pullCode = await withHeadlessDockerConfig(
     platform,
-    composeCommand("pull", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
+    composeCommand("pull", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine }),
     (pullSpec) => execute(pullSpec, { stdin, stdout, stderr })
   );
   if (pullCode !== 0) {
@@ -1419,7 +1427,7 @@ async function repairRuntime({ root, config, platform, stdin, stdout, stderr, ex
   }
   if (await verifyStorage({ root, config, existingConfig: config, operation: "repair", inspectResources, execute, stdout, stderr }) !== 0) return 1;
   const upCode = await execute(
-    composeCommand("repair", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
+    composeCommand("repair", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine }),
     { stdin, stdout, stderr }
   );
   if (upCode !== 0) {
@@ -1446,6 +1454,7 @@ async function repairRuntime({ root, config, platform, stdin, stdout, stderr, ex
   return 0;
 }
 
+/** Cuts over to a new runtime version using the installation's resolved engine. */
 async function performUpdate({
   root,
   config,
@@ -1561,6 +1570,7 @@ async function collectFiles(directory, logicalDirectory) {
 // Writers (core, CLI, browser, Temporal) are frozen, not stopped, while the backup runs in a one-off container:
 // the database, files, memory and Temporal histories are one moment and CLI sessions survive (external review
 // 2026-10-16). Compose skips services that are not running.
+/** Pauses writers, runs the portable backup, then unpauses them. */
 async function backupWithWritersPaused(execute, root, config, io) {
   const options = { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine };
   io.stdout.write("Pausing SpaceApp writers for the backup; the app and CLI sessions resume afterwards...\n");
@@ -1593,6 +1603,7 @@ async function createQuiescedCheckpoint(root, config, io) {
   }
 }
 
+/** Writes a database checkpoint through the installation's resolved engine. */
 async function createCheckpoint(root, config, { stdin, stdout, stderr, execute, platform }) {
   const id = checkpointId();
   const path = join(root, "checkpoints", id);
@@ -1703,6 +1714,7 @@ async function requireChangeApproval(stdin, stdout, stderr, lines) {
   return finalConfirmation(stdin, stdout, lines);
 }
 
+/** Prints engine logs after a failed install using the engine that was attempted. */
 async function reportInstallDiagnostics({
   root,
   stateRoot,
@@ -1741,6 +1753,7 @@ async function reportInstallDiagnostics({
   }
 }
 
+/** Stops the failed install's containers with the same engine that started them. */
 async function restoreRuntimeAfterFailedInstall({
   root,
   stagedStateRoot,
@@ -1802,6 +1815,7 @@ async function restoreRuntimeAfterFailedInstall({
   }
 }
 
+/** Uses --engine when it was passed, otherwise the engine field from --answers. */
 function engineFromAnswers(stdin, requestedEngine) {
   if (requestedEngine !== undefined) return requestedEngine;
   const raw = stdin?._spaceappPromptController?.answers?.engine;
@@ -1809,6 +1823,7 @@ function engineFromAnswers(stdin, requestedEngine) {
   return resolveEngine(String(raw));
 }
 
+/** Reads --engine from a reinstall command. */
 function parseReinstallEngineArg(args) {
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -1822,6 +1837,7 @@ function parseReinstallEngineArg(args) {
   return undefined;
 }
 
+/** Parses install flags, including --engine docker|podman. */
 function parseInstallArgs(args) {
   let requestedProfile = "auto";
   let requestedAccessMode;
@@ -1913,6 +1929,7 @@ function assertRegisteredUser(config, userId) {
   }
 }
 
+/** Adds or removes a workspace and syncs mounts with the installation's engine. */
 async function workspaceCommand(rawArgs, { root, config, platform, stdin, stdout, stderr, execute }) {
   const { userId, args } = takeUserOption(rawArgs);
   if (userId) assertRegisteredUser(config, userId);
@@ -2059,6 +2076,7 @@ async function restoreBackupExtras({ root, config, backupId, stdin, stdout, stde
   stdout.write(`API keys and CLI logins are never in backups: enter them again with "${UNIVERSAL_COMMAND} credentials set <provider>".\n`);
 }
 
+/** Writes or removes a provider credential and recreates the CLI container. */
 async function credentialsCommand(rawArgs, { root, config, stdin, stdout, stderr, execute }) {
   const { userId, args } = takeUserOption(rawArgs);
   if (userId) assertRegisteredUser(config, userId);
@@ -2133,6 +2151,7 @@ async function waitForUserCli({ root, config, userId, stdin, stdout, stderr, exe
   return 1;
 }
 
+/** Adds or removes a user container through the installation's engine. */
 async function userCommand(args, { root, config, stdin, stdout, stderr, execute, request, sleep }) {
   const [action, userId, ...rest] = args;
   const apply = async (updated, message) => {
@@ -2181,6 +2200,7 @@ async function userCommand(args, { root, config, stdin, stdout, stderr, execute,
   throw new Error(`Usage: ${UNIVERSAL_COMMAND} user <enable|add <user-id> [--memory <2g>]|restore <user-id>|remove <user-id>|list>`);
 }
 
+/** Installs a provider CLI inside the selected engine. */
 async function providerCommand(rawArgs, { root, config, stdin, stdout, stderr, execute }) {
   const { userId, args } = takeUserOption(rawArgs);
   if (args.length !== 2 || args[0] !== "install") {
@@ -2196,6 +2216,7 @@ async function providerCommand(rawArgs, { root, config, stdin, stdout, stderr, e
   return execute(composeCommand(action, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine, provider, service }), { stdin, stdout, stderr });
 }
 
+/** Rotates the owner setup token or resets the owner password. */
 async function ownerCommand(args, { root, config, stdin, stdout, stderr, execute }) {
   if (args.length === 1 && args[0] === "rotate-setup-token") {
     const token = randomBytes(32).toString("base64url");
@@ -2228,6 +2249,7 @@ async function ownerCommand(args, { root, config, stdin, stdout, stderr, execute
   });
 }
 
+/** Recreates containers. An engine change is refused before this runs. */
 async function reinstallCommand({
   root,
   config,
@@ -2282,6 +2304,7 @@ async function reinstallCommand({
   return 0;
 }
 
+/** Writes a support bundle with engine, rootless, and cgroup facts and no secrets. */
 async function supportBundleCommand({
   root,
   config,
@@ -2349,6 +2372,7 @@ async function supportBundleCommand({
   return 0;
 }
 
+/** Purges volumes with the installation's engine and resets the local config. */
 async function factoryResetCommand({
   root,
   config,
@@ -2415,6 +2439,7 @@ async function factoryResetCommand({
   return 0;
 }
 
+/** Checks the resolved engine, then upgrades the runtime. */
 async function updateCommand(args, { root, config, version, platform, stdin, stdout, stderr, execute, request, sleep, inspectResources = inspectSystemResources, ensureDocker = ensureDockerAvailable, env = process.env, arch = process.arch }) {
   if (args.length > 1) {
     throw new Error(`Usage: ${UNIVERSAL_COMMAND} update [version]`);
@@ -2488,14 +2513,15 @@ async function updateCommand(args, { root, config, version, platform, stdin, std
       return 0;
     }
   }
+  const engine = resolveEngine(config);
   const prerequisites = await ensureDocker({ platform, arch, env, stdin, stdout, stderr, execute,
-    installArgs: { root, requestedProfile: config.profile, requestedEngine: config.engine, noOpen: true, autoConfirm: true },
-    ...(config.engine ? { engine: config.engine } : {}) });
+    installArgs: { root, requestedProfile: config.profile, requestedEngine: engine, noOpen: true, autoConfirm: true },
+    engine });
   if (prerequisites.reexecuted || prerequisites.code !== 0) return prerequisites.code;
   const resources = await inspectResources(root);
   const storagePlan = await inspectStoragePlan({ root, config: { ...config, version: targetVersion }, existingConfig: config, resources, execute, operation: "upgrade" });
   if (await doctor({ root, platform, stdout, stderr, execute, stdin, inspectResources, resources,
-    profile: config.profile, dockerReady: true, operation: "upgrade", storagePlan, engine: config.engine }) !== 0) return 1;
+    profile: config.profile, dockerReady: true, operation: "upgrade", storagePlan, engine }) !== 0) return 1;
   return performUpdate({
     root,
     config,
@@ -2524,6 +2550,7 @@ async function verifyStorage({ root, config, existingConfig, operation, inspectR
   return 0;
 }
 
+/** Reports host resources and, for Podman, version, rootless mode, and cgroup delegation. */
 async function doctor({
   root,
   platform,
@@ -2754,6 +2781,7 @@ async function requestSetupStatus({ url, request }) {
   }
 }
 
+/** Turns a missing docker or podman CLI into install guidance. */
 async function executeWithDockerDiagnostics(execute, spec, io, { platform, stderr }) {
   const code = await execute(spec, io);
   if (spec.command === "docker" && code === 127) {
@@ -2828,6 +2856,7 @@ export function executeCommand(spec, { stdin, stdout, stderr, input } = {}) {
   });
 }
 
+/** Spawns one allowlisted command, including podman. */
 function spawnTrustedCommand(spec, options) {
   const args = spec.args;
   switch (spec.command) {
@@ -2932,6 +2961,7 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+/** Prints command help, including install --engine docker|podman. */
 function helpText() {
   return `SpaceApp self-hosted launcher
 
