@@ -94,9 +94,26 @@ export class TraceContextRegistry {
 
 export const requestTraceContexts = new TraceContextRegistry();
 
-/** traceparent for work started on behalf of this Space request id, if known. */
+/**
+ * traceparent for work started on behalf of this Space request id, if known.
+ * This is the request span itself (the exported SERVER span), not a further
+ * child, so a workflow span can parent directly to that span.
+ */
 export function traceparentForTraceId(traceId: string | null | undefined, registry = requestTraceContexts): string | null {
-  return childTraceparent(registry.lookup(traceId)?.traceparent ?? null);
+  const traceparent = registry.lookup(traceId)?.traceparent;
+  return parseTraceparent(traceparent) ? traceparent! : null;
+}
+
+/**
+ * Correlation memo for a memory workflow started while its request is still
+ * registered. Returns undefined when this process has no traceparent for the
+ * id, so a start with no request context keeps the options it had before.
+ */
+export function memoryWorkflowMemo(traceId: string): Record<string, string> | undefined {
+  const traceparent = traceparentForTraceId(traceId);
+  if (!traceparent) return undefined;
+  const memo = workflowCorrelationMemo({ traceId, traceparent });
+  return Object.keys(memo).length ? memo : undefined;
 }
 
 /** Adds the request's traceparent to a turn input unless it already has a valid one. */

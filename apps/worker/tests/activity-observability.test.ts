@@ -8,6 +8,7 @@ import {
   noteActivityFailureReason,
   observeActivityExecution
 } from "../src/activity-observability.js";
+import { OTLP_HEADER, encodeOtlpHeader } from "../src/otlp-span-context.js";
 import { captureWorkerLogs, workerLog } from "../src/worker-log.js";
 import {
   createWorkerMetrics,
@@ -186,8 +187,14 @@ it("registers the activity interceptor on every Temporal worker, including both 
   const { readFile } = await import("node:fs/promises");
   for (const entry of ["worker.ts", "memory-maintenance-worker.ts", "memory-mutation-worker.ts"]) {
     const source = await readFile(new URL(`../src/${entry}`, import.meta.url), "utf8");
-    expect(source, entry).toMatch(/interceptors: \{ activity: \[createActivityObservabilityInterceptors\(\{ spans \}\)\] \}/);
+    expect(source, entry).toContain("workerOtlpWorkerOptions(spans)");
+    expect(source, entry).not.toContain("createActivityObservabilityInterceptors");
   }
+  const otlp = await readFile(new URL("../src/worker-otlp.ts", import.meta.url), "utf8");
+  expect(otlp).toContain("createActivityObservabilityInterceptors({ spans })");
+  expect(otlp).toContain("workflowModules");
+  expect(otlp).toContain("callDuringReplay: false");
+  expect(otlp).toContain("if (!spans) return { interceptors }");
 });
 
 it("exports one INTERNAL span per activity under the caller's traceparent", async () => {
@@ -202,4 +209,43 @@ it("exports one INTERNAL span per activity under the caller's traceparent", asyn
   expect(recorded).toHaveLength(1);
   expect(recorded[0]).toMatchObject({ traceId: "4bf92f3577b34da6a3ce929d0e0e4736", parentSpanId: "00f067aa0ba902b7", name: "activity runTurn",
     kind: 1, error: false, startTimeUnixNano: 1_000_000_000n, endTimeUnixNano: 1_250_000_000n });
+});
+
+it("parents an activity attempt to the workflow span and strips prompts, paths and error text", async () => {
+  const recorded: Array<Record<string, unknown>> = [];
+  const spans = { record: (span: Record<string, unknown>) => recorded.push(span), flush: async () => undefined, close: async () => undefined, stats: () => ({ exported: 0, dropped: 0, failed: 0 }) };
+  const workflowSpanId = "abcdef0123456789";
+  const headers = {
+    [OTLP_HEADER]: encodeOtlpHeader({
+      traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+      workflowSpanId,
+      rootParentSpanId: "00f067aa0ba902b7",
+      mode: "activity"
+    })
+  };
+  const secret = "SECRET USER PROMPT sk-live-otlp /tmp/private/notes.txt https://user.example/secret";
+  await expect(observeActivityExecution(
+    info(),
+    [{ traceparent, prompt: secret, roomId: "room:alpha01", paneId: "pane:alpha01", missionId: "mission:1", traceId: "req:abcdefghijkl", note: secret }],
+    async () => { throw Object.assign(new Error(secret), { code: "TOOL_UNAVAILABLE" }); },
+    { spans: spans as never, headers }
+  )).rejects.toThrow(secret);
+  expect(recorded).toHaveLength(1);
+  const span = recorded[0]!;
+  expect(span).toMatchObject({
+    traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+    parentSpanId: workflowSpanId,
+    error: true,
+    attributes: expect.objectContaining({
+      "space.attempt": 1,
+      "space.outcome": "FAILED",
+      "space.reason_code": "TOOL_UNAVAILABLE",
+      "space.category": "TOOL_UNAVAILABLE",
+      "space.room_id": "room:alpha01",
+      "space.pane_id": "pane:alpha01",
+      "space.mission_id": "mission:1",
+      "space.trace_id": "req:abcdefghijkl"
+    })
+  });
+  expect(JSON.stringify({ name: span.name, attributes: span.attributes, parentSpanId: span.parentSpanId })).not.toMatch(/SECRET|sk-live-otlp|notes\.txt|user\.example/);
 });
