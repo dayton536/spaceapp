@@ -1545,4 +1545,79 @@ describe("Memory graph API", () => {
     ]));
     await app.close();
   });
+
+  it("accepts an overview limit up to 50,000 nodes and scales edges, while redaction and auth stay in place", async () => {
+    const locked = await memoryGraphApp(true);
+    const unauthenticated = await locked.inject({ method: "GET", url: "/api/admin/memory/graph/overview?limit=50000" });
+    expect(unauthenticated.statusCode).toBe(401);
+    await locked.close();
+
+    const graphSnapshot = snapshot() as MemoryGraphSnapshot;
+    const nodeCount = 3_000;
+    const edgeCount = 9_000;
+    graphSnapshot.nodes = Array.from({ length: nodeCount }, (_, index) => ({
+      id: `memory:limit-${String(index).padStart(4, "0")}`,
+      type: "MEMORY" as const,
+      label: index === 0 ? "sk_test_abcdefghijklmnop" : `Memory ${index}`,
+      sourcePath: null,
+      recordId: null
+    }));
+    graphSnapshot.edges = Array.from({ length: edgeCount }, (_, index) => ({
+      id: `edge:limit-${String(index).padStart(4, "0")}`,
+      type: "CONTAINS" as const,
+      source: `memory:limit-${String(index % nodeCount).padStart(4, "0")}`,
+      target: `memory:limit-${String((index * 3 + 1) % nodeCount).padStart(4, "0")}`
+    }));
+    graphSnapshot.summary = { ...graphSnapshot.summary, nodeCount, edgeCount, recordCount: 0, sourceCount: 0 };
+    const app = await memoryGraphApp(true, new InMemorySpaceStore(), false, undefined, { graphSnapshot });
+    const started = performance.now();
+    const limited = await app.inject({ method: "GET", url: "/api/admin/memory/graph/overview?limit=1000", headers: { cookie } });
+    const limitedMs = performance.now() - started;
+    expect(limited.statusCode).toBe(200);
+    expect(limited.json().data.nodes).toHaveLength(1000);
+    expect(limited.json().data.edges.length).toBeLessThanOrEqual(3000);
+    expect(JSON.stringify(limited.json())).not.toContain("sk_test_abcdefghijklmnop");
+    expect(JSON.stringify(limited.json())).toContain("[REDACTED Stripe key]");
+    const invalid = await app.inject({ method: "GET", url: "/api/admin/memory/graph/overview?limit=50001", headers: { cookie } });
+    expect(invalid.statusCode).toBe(422);
+
+    const fullSnapshot = snapshot() as MemoryGraphSnapshot;
+    fullSnapshot.nodes = Array.from({ length: 50_000 }, (_, index) => ({
+      id: `memory:full-${String(index).padStart(5, "0")}`,
+      type: "MEMORY" as const,
+      label: `N${index}`,
+      sourcePath: null,
+      recordId: null
+    }));
+    fullSnapshot.edges = Array.from({ length: 150_000 }, (_, index) => ({
+      id: `edge:full-${String(index).padStart(6, "0")}`,
+      type: "CONTAINS" as const,
+      source: `memory:full-${String(index % 50_000).padStart(5, "0")}`,
+      target: `memory:full-${String((index * 7 + 1) % 50_000).padStart(5, "0")}`
+    }));
+    fullSnapshot.summary = { ...fullSnapshot.summary, nodeCount: 50_000, edgeCount: 150_000, recordCount: 0, sourceCount: 0 };
+    const fullApp = await memoryGraphApp(true, new InMemorySpaceStore(), false, undefined, { graphSnapshot: fullSnapshot });
+    const fullStarted = performance.now();
+    const full = await fullApp.inject({ method: "GET", url: "/api/admin/memory/graph/overview?limit=50000", headers: { cookie } });
+    const serverMs = performance.now() - fullStarted;
+    expect(full.statusCode).toBe(200);
+    const body = full.json();
+    expect(body.data.nodes).toHaveLength(50_000);
+    expect(body.data.edges).toHaveLength(150_000);
+    expect(body.data.truncated).toBe(false);
+    const bytes = Buffer.byteLength(full.body);
+    const bench = {
+      overviewLimit: 1000,
+      limitedMs: Number(limitedMs.toFixed(1)),
+      nodes: 50_000,
+      edges: 150_000,
+      responseBytes: bytes,
+      responseMiB: Number((bytes / (1024 * 1024)).toFixed(2)),
+      serverMs: Number(serverMs.toFixed(1)),
+      serverTiming: full.headers["server-timing"] ?? null
+    };
+    process.stdout.write(`MEMORY_OVERVIEW_BENCH ${JSON.stringify(bench)}\n`);
+    await app.close();
+    await fullApp.close();
+  }, 60_000);
 });

@@ -10,6 +10,9 @@ import {
   idSchema,
   listMemoryGraphOverviewQuerySchema,
   listMemoryGraphQuerySchema,
+  MEMORY_GRAPH_OVERVIEW_DEFAULT_NODE_LIMIT,
+  MEMORY_GRAPH_OVERVIEW_MAX_NODE_LIMIT,
+  memoryGraphOverviewEdgeLimit,
   listMemoryChangeSetsQuerySchema,
   listMemoryIssuesQuerySchema,
   memoryCalendarQuerySchema,
@@ -312,9 +315,14 @@ function memoryIssuesRevisionHash(snapshotRevision: string, states: MemoryIssueS
   return digest(JSON.stringify({ snapshotRevision, stateRevisions }));
 }
 
-// Keep the same payload budget while retaining the taxonomy needed to interpret a large archive.
-export function selectOverviewNodes(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[]): MemoryGraphNode[] {
-  if (nodes.length <= 2000) return nodes;
+/**
+ * Selects the overview sample. The default limit is 2,000 nodes.
+ * A larger `limit` (capped by the caller at the server maximum) keeps the same
+ * source, topic, and tagged-neighbor reservations, then fills the remaining budget.
+ */
+export function selectOverviewNodes(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[], nodeLimit = MEMORY_GRAPH_OVERVIEW_DEFAULT_NODE_LIMIT): MemoryGraphNode[] {
+  const limit = Math.max(1, Math.min(MEMORY_GRAPH_OVERVIEW_MAX_NODE_LIMIT, Math.floor(nodeLimit) || MEMORY_GRAPH_OVERVIEW_DEFAULT_NODE_LIMIT));
+  if (nodes.length <= limit) return nodes;
   const members = new Map<string, Set<string>>();
   const explicit = new Set<string>();
   const byId = new Map(nodes.map(node => [node.id, node]));
@@ -327,16 +335,21 @@ export function selectOverviewNodes(nodes: MemoryGraphNode[], edges: MemoryGraph
   const topics = nodes.filter(node => members.has(node.id)).sort((a, b) =>
     Number(explicit.has(b.id)) - Number(explicit.has(a.id)) ||
     members.get(b.id)!.size - members.get(a.id)!.size || a.id.localeCompare(b.id)
-  ).slice(0, 160);
-  const sources = nodes.filter(node => node.type === "SOURCE").sort((a, b) => Number(isMemoryCoreFile(b.label)) - Number(isMemoryCoreFile(a.label)) || a.id.localeCompare(b.id)).slice(0, 120);
-  const selected = new Map([...sources, ...topics].map(node => [node.id, node]));
+  ).slice(0, Math.min(160, limit));
+  const sources = nodes.filter(node => node.type === "SOURCE").sort((a, b) => Number(isMemoryCoreFile(b.label)) - Number(isMemoryCoreFile(a.label)) || a.id.localeCompare(b.id)).slice(0, Math.min(120, limit));
+  const selected = new Map<string, MemoryGraphNode>();
+  for (const node of [...sources, ...topics]) {
+    if (selected.size >= limit) break;
+    selected.set(node.id, node);
+  }
   // Give every reserved topic a real visible neighbor, even for sparse explicit tags.
   for (const topic of topics) {
+    if (selected.size >= limit) break;
     const first = [...members.get(topic.id)!].sort()[0];
-    if (first) selected.set(first, byId.get(first)!);
+    if (first && !selected.has(first)) selected.set(first, byId.get(first)!);
   }
   for (const node of nodes) {
-    if (selected.size >= 2000) break;
+    if (selected.size >= limit) break;
     selected.set(node.id, node);
   }
   return [...selected.values()];
@@ -355,13 +368,18 @@ export function registerMemoryGraphRoutes(
 ): void {
   app.get("/api/admin/memory/graph/overview", async (request, reply) => {
     requireMemoryGraph(options.config);
+    const startedAt = performance.now();
     const query = listMemoryGraphOverviewQuerySchema.parse(request.query);
     const snapshotData = query.month
       ? await (options.service.getArchiveSnapshotState?.() ?? options.service.getArchiveSnapshot().then(snapshot => ({ snapshot, isStale: false })))
       : await options.service.getSnapshot();
     const { isStale } = snapshotData;
     const snapshot = await options.service.withSourceTopology?.(snapshotData.snapshot) ?? snapshotData.snapshot;
-    if (setSnapshotEtag(request, reply, snapshot.revisionHash ?? snapshot.sourceHash)) return reply.code(304).send();
+    const revision = snapshot.revisionHash ?? snapshot.sourceHash;
+    const etagRevision = query.limit === MEMORY_GRAPH_OVERVIEW_DEFAULT_NODE_LIMIT
+      ? revision
+      : digest(`${revision}:${query.limit}`);
+    if (setSnapshotEtag(request, reply, etagRevision)) return reply.code(304).send();
     const availableMonths = await options.service.listAvailableMonths();
 
     const anchors = filterNodes(snapshot, query).sort((left, right) => left.id.localeCompare(right.id));
@@ -385,12 +403,13 @@ export function registerMemoryGraphRoutes(
       matchingNodeIds.has(edge.target) &&
       (query.relationMode !== "RELATIONS" || anchorIds.has(edge.source) || anchorIds.has(edge.target))
     );
-    const selectedNodes = selectOverviewNodes(matchingNodes, matchingEdges);
+    const selectedNodes = selectOverviewNodes(matchingNodes, matchingEdges, query.limit);
     const selectedNodeIds = new Set(selectedNodes.map((node) => node.id));
+    const edgeLimit = memoryGraphOverviewEdgeLimit(query.limit);
     const selectedEdges = matchingEdges
       .filter((edge) => selectedNodeIds.has(edge.source) && selectedNodeIds.has(edge.target))
       .sort((a, b) => Number(b.type === "CONTAINS" || b.type === "DERIVED_FROM") - Number(a.type === "CONTAINS" || a.type === "DERIVED_FROM"))
-      .slice(0, 6000);
+      .slice(0, edgeLimit);
     const data = memoryGraphOverviewPayloadSchema.parse({
       version: snapshot.version,
       layoutVersion: snapshot.layoutVersion,
@@ -417,6 +436,7 @@ export function registerMemoryGraphRoutes(
       },
       months: availableMonths
     });
+    reply.header("Server-Timing", `memory-overview;dur=${(performance.now() - startedAt).toFixed(1)}`);
     return { data };
   });
 

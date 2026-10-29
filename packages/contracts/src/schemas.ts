@@ -7368,11 +7368,30 @@ export const memoryGraphPayloadSchema = z.object({
   months: z.array(z.string().max(7)).default([])
 });
 
+/** Default overview sample. The 3D view may request more, up to the hard maximum. */
+export const MEMORY_GRAPH_OVERVIEW_DEFAULT_NODE_LIMIT = 2_000;
+/** Hard server cap for `GET /api/admin/memory/graph/overview?limit=`. */
+export const MEMORY_GRAPH_OVERVIEW_MAX_NODE_LIMIT = 50_000;
+/** Edge budget that matches the historical 2,000-node overview. */
+export const MEMORY_GRAPH_OVERVIEW_DEFAULT_EDGE_LIMIT = 6_000;
+/** Edge budget at the hard node maximum (three edges per requested node). */
+export const MEMORY_GRAPH_OVERVIEW_MAX_EDGE_LIMIT = 150_000;
+
+/**
+ * Scales the overview edge budget with the requested node limit.
+ * 2,000 nodes keep 6,000 edges; 50,000 nodes allow 150,000 edges.
+ */
+export function memoryGraphOverviewEdgeLimit(nodeLimit: number): number {
+  const nodes = Math.max(1, Math.min(MEMORY_GRAPH_OVERVIEW_MAX_NODE_LIMIT, Math.floor(nodeLimit) || MEMORY_GRAPH_OVERVIEW_DEFAULT_NODE_LIMIT));
+  const scaled = Math.round(nodes * (MEMORY_GRAPH_OVERVIEW_DEFAULT_EDGE_LIMIT / MEMORY_GRAPH_OVERVIEW_DEFAULT_NODE_LIMIT));
+  return Math.min(MEMORY_GRAPH_OVERVIEW_MAX_EDGE_LIMIT, Math.max(1, scaled));
+}
+
 export const memoryGraphOverviewPayloadSchema = memoryGraphPayloadSchema
   .omit({ nodes: true, edges: true })
   .extend({
-    nodes: z.array(memoryGraphNodeSchema).max(2000),
-    edges: z.array(memoryGraphEdgeSchema).max(6000),
+    nodes: z.array(memoryGraphNodeSchema).max(MEMORY_GRAPH_OVERVIEW_MAX_NODE_LIMIT),
+    edges: z.array(memoryGraphEdgeSchema).max(MEMORY_GRAPH_OVERVIEW_MAX_EDGE_LIMIT),
     totalMatchingNodes: z.number().int().min(0),
     totalMatchingEdges: z.number().int().min(0),
     truncated: z.boolean()
@@ -7403,6 +7422,8 @@ export const listMemoryGraphOverviewQuerySchema = listMemoryGraphQuerySchema.omi
   pageSize: true,
   sortBy: true,
   sortOrder: true
+}).extend({
+  limit: z.coerce.number().int().min(1).max(MEMORY_GRAPH_OVERVIEW_MAX_NODE_LIMIT).default(MEMORY_GRAPH_OVERVIEW_DEFAULT_NODE_LIMIT)
 });
 
 export const memoryCalendarQuerySchema = z.object({

@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+- The 3D memory graph draws with WebGL2 (instanced nodes, batched edges, GPU depth) and can load up to 50,000 nodes and 150,000 edges. Hover and click use a spatial index, titles stay bounded, and the force layout streams while it converges. Without WebGL2, or after a lost context, the view falls back to the Canvas 2D renderer capped at 2,000 nodes. Demo mode can synthesize a 2k, 10k, or 50k graph.
+
 ## [1.1.9] - 2026-10-25
 
 Source: sanitized Space app @ 4be1c81f55 (5029 files). 1.1.8 was prepared but never published; its changes are part of

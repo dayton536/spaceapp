@@ -120,6 +120,8 @@ import {
   listMemoryQuerySchema,
   listMemoryGraphQuerySchema,
   listMemoryGraphOverviewQuerySchema,
+  memoryGraphOverviewEdgeLimit,
+  MEMORY_GRAPH_OVERVIEW_MAX_NODE_LIMIT,
   listMemoryIssuesQuerySchema,
   listMemoryIssueStatesQuerySchema,
   listMemoryChangeSetsQuerySchema,
@@ -4088,8 +4090,13 @@ describe("Space contracts", () => {
     expect(overview.totalMatchingNodes).toBe(1);
     expect(listMemoryGraphOverviewQuerySchema.parse({ nodeType: "MEMORY" })).toMatchObject({
       nodeType: "MEMORY",
-      relationMode: "RELATIONS"
+      relationMode: "RELATIONS",
+      limit: 2000
     });
+    expect(listMemoryGraphOverviewQuerySchema.parse({ limit: "50000" }).limit).toBe(MEMORY_GRAPH_OVERVIEW_MAX_NODE_LIMIT);
+    expect(memoryGraphOverviewEdgeLimit(2000)).toBe(6000);
+    expect(memoryGraphOverviewEdgeLimit(50_000)).toBe(150_000);
+    expect(() => listMemoryGraphOverviewQuerySchema.parse({ limit: 50_001 })).toThrow();
 
     expect(memoryCacheLinkSchema.parse({
       memoryRecordId: "memory:cache-record",

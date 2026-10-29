@@ -1,4 +1,5 @@
-import { taskTitleSettingsSchema, shortTaskTitle, roomSchema, paneSchema, userSettingsSchema, userLinkSchema, clipboardItemSchema, taskItemSchema, taskScheduleNextRunAt, artifactSchema, MAX_ROOMS, pickNextAvailableRoomName, roomLimitReached, SETUP_CATALOG, SETUP_CATALOG_VERSION, buildSetupSelection } from "@space/contracts";
+import { taskTitleSettingsSchema, shortTaskTitle, roomSchema, paneSchema, userSettingsSchema, userLinkSchema, clipboardItemSchema, taskItemSchema, taskScheduleNextRunAt, artifactSchema, MAX_ROOMS, pickNextAvailableRoomName, roomLimitReached, SETUP_CATALOG, SETUP_CATALOG_VERSION, buildSetupSelection, memoryGraphOverviewEdgeLimit } from "@space/contracts";
+import { generateSyntheticMemoryGraph, syntheticMemoryGraphSize } from "./synthetic-memory-graph.js";
 import { demoHealthSnapshot } from "./demo-health.js";
 import { defaultUserSettings, canonicalizeUserLinkUrl, cliToggleRuntimeIds, streamingMetricDefinitions, defaultToolRoutingState, buildEffectiveToolPlan, updateToolRoutingSchema, buildDotToolCatalog, dotWorkspacePath, dotUserSettingsFrom, summarizeDotProactiveUsage } from "@space/contracts";
 import type { DotUserSettings, UpdateDotUserSettings } from "@space/contracts";
@@ -22,6 +23,7 @@ import type {
   MemoryChangeSet,
   MemoryChangeSetSummary,
   MemoryGraphNode,
+  MemoryGraphOverviewPayload,
   MemoryGraphPayload,
   Pane,
   Room,
@@ -148,6 +150,10 @@ type DemoMemoryGraphQuery = {
   relationMode?: "CLUSTERED" | "RELATIONS";
   page?: number;
   pageSize?: number;
+  /** Overview node budget. Omitted requests use the fixture as-is. */
+  limit?: number;
+  /** Demo-only benchmark size. Not sent to a live API. */
+  syntheticNodes?: number;
 };
 
 function memoryChangeSetSummary(changeSet: MemoryChangeSet): MemoryChangeSetSummary {
@@ -204,6 +210,7 @@ function initialSetupConnectionResults(): Map<string, DemoSetupConnectionResult>
 
 export class DemoStore {
   private fixture = cloneFixture();
+  private syntheticOverview: { key: number; data: MemoryGraphOverviewPayload } | null = null;
   private sequence = 0;
   private cliRuntimeEnabled = new Map<CliToggleRuntimeId, boolean>(
     cliToggleRuntimeIds.map((runtimeId) => [runtimeId, true])
@@ -709,6 +716,40 @@ export class DemoStore {
         month: query.month ?? null
       }
     });
+  }
+
+  /** Serves the fixture overview, or a deterministic synthetic graph when a benchmark size is requested. */
+  private async memoryGraphOverview(query: DemoMemoryGraphQuery) {
+    if (query.syntheticNodes && query.syntheticNodes > 0) {
+      const size = syntheticMemoryGraphSize(query.syntheticNodes).nodes;
+      if (!this.syntheticOverview || this.syntheticOverview.key !== size) {
+        this.syntheticOverview = { key: size, data: await generateSyntheticMemoryGraph(size) };
+      }
+      let data = this.syntheticOverview.data;
+      const limit = query.limit && query.limit < data.nodes.length ? query.limit : data.nodes.length;
+      if (limit < data.nodes.length) {
+        const nodes = data.nodes.slice(0, limit);
+        const ids = new Set(nodes.map(node => node.id));
+        const edges = data.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)).slice(0, memoryGraphOverviewEdgeLimit(limit));
+        data = {
+          ...data,
+          nodes,
+          edges,
+          truncated: true,
+          summary: { ...data.summary, nodeCount: nodes.length, edgeCount: edges.length, recordCount: nodes.filter(node => node.type === "MEMORY").length }
+        };
+      }
+      const needle = query.q?.trim().toLowerCase();
+      if (needle) {
+        const nodes = data.nodes.filter(node => node.label.toLowerCase().includes(needle) || node.sourcePath?.toLowerCase().includes(needle));
+        const ids = new Set(nodes.map(node => node.id));
+        const edges = data.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target));
+        data = { ...data, nodes, edges, totalMatchingNodes: nodes.length, totalMatchingEdges: edges.length, truncated: nodes.length !== this.syntheticOverview.data.nodes.length };
+      }
+      return { data };
+    }
+    const graph = this.memoryGraph(query);
+    return { data: { ...graph, totalMatchingNodes: graph.nodes.length, totalMatchingEdges: graph.edges.length, truncated: false } };
   }
 
   private invokeStreamingBot(method: string, args: unknown[]): unknown {
@@ -1512,10 +1553,8 @@ export class DemoStore {
           pagination: page.pagination
         });
       }
-      case "memoryGraphOverview": {
-        const graph = this.memoryGraph((args[0] ?? {}) as DemoMemoryGraphQuery);
-        return Promise.resolve({ data: { ...graph, totalMatchingNodes: graph.nodes.length, totalMatchingEdges: graph.edges.length, truncated: false } });
-      }
+      case "memoryGraphOverview":
+        return this.memoryGraphOverview((args[0] ?? {}) as DemoMemoryGraphQuery);
       case "memoryCalendar": {
         const query = (args[0] ?? {}) as { year?: number; month?: string; date?: string };
         const activeMonth = query.month && query.month !== "all" ? query.month : "2026-10";

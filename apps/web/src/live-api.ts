@@ -868,6 +868,85 @@ function looksLikeJsonPayload(raw: string): boolean {
   return trimmed.startsWith("{") || trimmed.startsWith("[");
 }
 
+/**
+ * Reads a response body in stream chunks, then transfers the bytes to the parse worker.
+ * Used when the 3D view asks for more than the default 2,000-node overview.
+ */
+async function requestLargeMemoryOverview(url: string): Promise<MemoryGraphOverviewResponse> {
+  const requestStartedAt = Date.now();
+  const response = await fetch(url, { credentials: "include" });
+  learnServerClock(response);
+  if (!response.ok) {
+    const payload = await readResponsePayload(response);
+    reportCoreApiResponse(response, payload, requestStartedAt);
+    if (isApiErrorPayload(payload)) {
+      throw new SpaceApiError(formatApiError(payload, `Request failed: ${response.status}`), {
+        code: payload.error.code,
+        status: response.status,
+        requestId: payload.error.requestId,
+        details: payload.error.details
+      });
+    }
+    throw new SpaceApiError(formatHttpFailure(response.status, payload), { status: response.status });
+  }
+  const buffer = await readResponseBuffer(response);
+  reportCoreApiResponse(response, null, requestStartedAt);
+  if (buffer.byteLength < 1_500_000) {
+    const text = new TextDecoder().decode(buffer);
+    return (text ? JSON.parse(text) : { data: { nodes: [], edges: [] } }) as MemoryGraphOverviewResponse;
+  }
+  return parseOverviewInWorker(buffer);
+}
+
+async function readResponseBuffer(response: Response): Promise<ArrayBuffer> {
+  const reader = response.body?.getReader();
+  if (!reader) return response.arrayBuffer();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    parts.push(value);
+    total += value.byteLength;
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    bytes.set(part, offset);
+    offset += part.byteLength;
+    if (parts.length > 4) await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  return bytes.buffer;
+}
+
+function parseOverviewInWorker(buffer: ArrayBuffer): Promise<MemoryGraphOverviewResponse> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./features/memory-workspace/memory-overview-parse.worker.ts", import.meta.url), { type: "module" });
+    const nodes: MemoryGraphOverviewPayload["nodes"] = [];
+    const edges: MemoryGraphOverviewPayload["edges"] = [];
+    let header: Partial<MemoryGraphOverviewPayload> = {};
+    worker.onmessage = (event: MessageEvent<{ kind: string; header?: Partial<MemoryGraphOverviewPayload>; nodes?: MemoryGraphOverviewPayload["nodes"]; edges?: MemoryGraphOverviewPayload["edges"]; message?: string }>) => {
+      const message = event.data;
+      if (message.kind === "header" && message.header) header = message.header;
+      else if (message.kind === "nodes" && message.nodes) nodes.push(...message.nodes);
+      else if (message.kind === "edges" && message.edges) edges.push(...message.edges);
+      else if (message.kind === "done") {
+        worker.terminate();
+        resolve({ data: { ...header, nodes, edges } as MemoryGraphOverviewPayload });
+      } else if (message.kind === "error") {
+        worker.terminate();
+        reject(new SpaceApiError(message.message ?? "Overview parse failed", { status: 500 }));
+      }
+    };
+    worker.onerror = () => {
+      worker.terminate();
+      reject(new SpaceApiError("Overview parse failed", { status: 500 }));
+    };
+    worker.postMessage(buffer, [buffer]);
+  });
+}
+
 async function readResponsePayload(response: Response): Promise<unknown> {
   if (typeof response.text !== "function") {
     if (typeof response.json === "function") {
@@ -3250,6 +3329,10 @@ export const api = {
     lifecycleStatus?: MemoryLifecycleStatus;
     month?: string;
     relationMode?: "CLUSTERED" | "RELATIONS";
+    /** Node budget. Defaults to 2,000 on the server. Values above 2,000 are parsed off the main thread. */
+    limit?: number;
+    /** Demo-only. The live client never puts this on the query string. */
+    syntheticNodes?: number;
   } = {}) => {
     const params = new URLSearchParams();
     if (query.q) params.set("q", query.q);
@@ -3260,8 +3343,11 @@ export const api = {
     if (query.lifecycleStatus) params.set("lifecycleStatus", query.lifecycleStatus);
     if (query.month) params.set("month", query.month);
     if (query.relationMode) params.set("relationMode", query.relationMode);
+    if (query.limit) params.set("limit", String(query.limit));
     const suffix = params.toString();
-    return request<MemoryGraphOverviewResponse>(`/api/admin/memory/graph/overview${suffix ? `?${suffix}` : ""}`);
+    const url = `/api/admin/memory/graph/overview${suffix ? `?${suffix}` : ""}`;
+    if (!query.limit || query.limit <= 2_000 || typeof Worker === "undefined") return request<MemoryGraphOverviewResponse>(url);
+    return requestLargeMemoryOverview(url);
   },
   memoryCalendar: (query: MemoryCalendarQuery = {}) => {
     const params = new URLSearchParams();
