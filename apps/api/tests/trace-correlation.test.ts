@@ -49,7 +49,9 @@ describe("request trace context", () => {
 
     registry.remember("req:dddddddddddd", createRequestTraceContext(inbound));
     const filled = withTurnTraceparent({ traceId: "req:dddddddddddd" }, registry);
+    const context = registry.lookup("req:dddddddddddd");
     expect(parseTraceparent(filled.traceparent)?.traceId).toBe(inboundTraceId);
+    expect(parseTraceparent(filled.traceparent)?.parentId).toBe(context?.spanId);
     const kept = withTurnTraceparent({ traceId: "req:dddddddddddd", traceparent: inbound }, registry);
     expect(kept.traceparent).toBe(inbound);
     expect(withTurnTraceparent({ traceId: "req:unknown00000" }, registry)).toEqual({ traceId: "req:unknown00000" });
@@ -157,6 +159,20 @@ describe("trace lookup projection", () => {
     expect(projected.causalError).toMatchObject({ code: "ROOM_AGENT_TOKEN_LIMIT", source: "room-agent-mission",
       eventId: "room_agent_mission:one", workflowId: null, at: "2026-10-16T09:05:00.000Z" });
   });
+
+  it("returns the CLI sessions a trace allocated with their task and revision ids", async () => {
+    const { projectTraceRecords } = await import("../src/trace-routes.js");
+    const projected = projectTraceRecords("req:clisession01", {
+      events: [], auditEvents: [], workflows: [],
+      cliSessions: [{ sessionId: "cli_session:one", paneId: "pane:cli", roomId: "room:cli", runtimeId: "cli:codex",
+        cliTaskId: "cli_task:one", cliTaskRevisionId: "not an identifier", launchMode: "RESUME", status: "RUNNING",
+        startedAt: "2026-10-27T16:00:00.000Z", endedAt: null }]
+    } as Parameters<typeof projectTraceRecords>[1]);
+    expect(projected.cliSessions).toEqual([{ sessionId: "cli_session:one", paneId: "pane:cli", roomId: "room:cli", runtimeId: "cli:codex",
+      cliTaskId: "cli_task:one", cliTaskRevisionId: null, launchMode: "RESUME", status: "RUNNING",
+      startedAt: "2026-10-27T16:00:00.000Z", endedAt: null }]);
+    expect(projectTraceRecords("req:clisession02", { events: [], auditEvents: [], workflows: [] }).cliSessions).toEqual([]);
+  });
 });
 
 function metricValue(pattern: RegExp): number {
@@ -222,8 +238,9 @@ describe("workflow starters", () => {
     };
 
     await coordinator.enqueue(item);
-    const signalOptions = (signalWithStart.mock.calls[0] as unknown as [string, { signalArgs: RoomAgentSupervisorQueueItem[] }])[1];
+    const signalOptions = (signalWithStart.mock.calls[0] as unknown as [string, { signalArgs: RoomAgentSupervisorQueueItem[]; memo: Record<string, string> }])[1];
     expect(parseTraceparent(signalOptions.signalArgs[0]?.turn.traceparent)?.traceId).toBe(inboundTraceId);
+    expect(signalOptions.memo).toMatchObject({ spaceTraceId: "req:roomagent0001", w3cTraceId: inboundTraceId, missionId: "room_agent_mission:trace" });
 
     requestTraceContexts.remember("req:internal0001", createRequestTraceContext(inbound));
     await coordinator.enqueueAction("room_agent_action:1", {

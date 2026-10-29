@@ -39,6 +39,27 @@ capabilities or cross-service compatibility. Authentication/server bootstrap,
 worker, web build and installer environment fields outside `SpaceApiConfig` are
 outside this registry. Full cross-service configuration coverage remains open.
 
+## Trace export
+
+`SPACE_OTEL_EXPORTER_OTLP_ENDPOINT` is optional and unset by default. When it is
+a plain `http` or `https` collector base URL with no user, password, query or
+fragment, the API and every Temporal worker (`space-worker`,
+`space-memory-maintenance-worker`, `space-memory-mutation-worker`) POST OTLP/HTTP
+JSON spans to `<endpoint>/v1/traces`. There is no OpenTelemetry SDK. When the
+variable is unset, invalid, or not a plain http(s) URL, those processes export
+nothing.
+
+One API request that starts Temporal work is one trace: the API SERVER span, then
+the workflow span (parented to the span id in the propagated `traceparent`), then
+one span per activity attempt. Child workflows nest under the workflow that
+started them. Continue-as-new and background continuations (`trace:bg-<id>`) add
+a span link to the run or trace they continue. Export uses a bounded queue that
+drops and counts overflow, a timeout on each POST, and never fails or delays the
+request, workflow or activity when the collector is slow or down. Exported
+attributes are ids, types, attempt, outcome, stable error code/category and
+durations. Prompts, model output, paths, URLs and error messages are not
+exported. See [observability](quality/observability.md).
+
 ## Optional modules
 
 `SPACE_OPTIONAL_MODULES` turns on modules beyond the coding workspace:

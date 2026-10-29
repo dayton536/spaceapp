@@ -120,6 +120,22 @@ describe("OTLP span exporter", () => {
     expect(unreachable.stats()).toEqual({ exported: 0, dropped: 0, failed: 1 });
   });
 
+  it("emits span links as trace and span ids and omits them when absent", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true }));
+    const created = exporter(fetchImpl);
+    created.record(span({
+      links: [
+        { traceId, spanId: parentId },
+        { traceId: "not-a-trace", spanId: parentId }
+      ]
+    }));
+    await created.flush();
+    const body = JSON.parse(fetchImpl.mock.calls[0]![1].body);
+    const exported = body.resourceSpans[0].scopeSpans[0].spans[0];
+    expect(exported.links).toEqual([{ traceId, spanId: parentId }]);
+    expect(JSON.stringify(exported.links)).not.toContain("attributes");
+  });
+
   it("ignores spans whose ids are not W3C trace and span ids", async () => {
     const fetchImpl = vi.fn(async () => ({ ok: true }));
     const created = exporter(fetchImpl);

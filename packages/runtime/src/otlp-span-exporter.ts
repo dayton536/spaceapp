@@ -1,8 +1,8 @@
 /**
- * Optional OTLP/HTTP (JSON) export of API server spans and worker activity spans. Off unless
- * SPACE_OTEL_EXPORTER_OTLP_ENDPOINT names a collector base URL (spans go to
- * `<base>/v1/traces`). No dependency, no collector required: Space logs stay
- * joinable by W3C trace id without it.
+ * Optional OTLP/HTTP (JSON) export of API server spans, worker workflow spans and
+ * activity spans. Off unless SPACE_OTEL_EXPORTER_OTLP_ENDPOINT names a collector
+ * base URL (spans go to `<base>/v1/traces`). No OpenTelemetry dependency and no
+ * collector required: Space logs stay joinable by W3C trace id without it.
  *
  * Spans carry only the method, route template, status code, service name and
  * Space request id; never URLs with parameters, headers, bodies or user data.
@@ -10,6 +10,12 @@
  * growing, each POST has a timeout, and a failing collector never affects a
  * request.
  */
+
+/** A link to another span (continue-as-new or a background continuation). Only ids are sent. */
+export interface SpanLink {
+  traceId: string;
+  spanId: string;
+}
 
 export interface ServerSpan {
   traceId: string;
@@ -22,6 +28,8 @@ export interface ServerSpan {
   error: boolean;
   /** OTLP span kind; SERVER (2) unless given. Worker activities use INTERNAL (1). */
   kind?: number;
+  /** OTLP span links. Omitted from the request when empty. */
+  links?: readonly SpanLink[];
 }
 
 export interface SpanExporterStats {
@@ -70,6 +78,16 @@ function attributeValue(value: string | number) {
   return typeof value === "number" && Number.isInteger(value) ? { intValue: String(value) } : { stringValue: String(value) };
 }
 
+function spanLinks(span: ServerSpan) {
+  const links = (span.links ?? []).flatMap((link) => (
+    traceIdPattern.test(link.traceId) && spanIdPattern.test(link.spanId)
+      ? [{ traceId: link.traceId, spanId: link.spanId }]
+      : []
+  ));
+  return links.length ? { links } : {};
+}
+
+/** OTLP/HTTP JSON body for one batch. Span links are ids only and are omitted when absent. */
 export function otlpTraceRequest(spans: readonly ServerSpan[], serviceName: string) {
   return {
     resourceSpans: [{
@@ -85,6 +103,7 @@ export function otlpTraceRequest(spans: readonly ServerSpan[], serviceName: stri
           startTimeUnixNano: span.startTimeUnixNano.toString(),
           endTimeUnixNano: span.endTimeUnixNano.toString(),
           attributes: Object.entries(span.attributes).map(([key, value]) => ({ key, value: attributeValue(value) })),
+          ...spanLinks(span),
           // STATUS_CODE_ERROR or STATUS_CODE_UNSET
           status: { code: span.error ? 2 : 0 }
         }))
