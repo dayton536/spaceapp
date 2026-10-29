@@ -2,8 +2,8 @@
 // Checks this checkout against PUBLIC_EXPORT_MANIFEST.json without access to the private tree:
 // every exported file must match the manifest's SHA-256 and size; a file whose bytes still hash to
 // the recorded private git blob id was exported unchanged, any other file was sanitized.
-import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -31,6 +31,25 @@ export async function verifyExportProvenance(root) {
   return result;
 }
 
+async function readExportedFile(root, filePath) {
+  try {
+    return await readFile(join(root, filePath));
+  } catch (error) {
+    throw new Error(`Cannot read exported file ${filePath}`, { cause: error });
+  }
+}
+
+async function replaceFileAtomically(target, contents) {
+  const tmpPath = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    await writeFile(tmpPath, contents);
+    await rename(tmpPath, target);
+  } catch (error) {
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 /** Refresh sha256 and size for manifest entries whose bytes changed, then recompute transformations. */
 export async function writeExportProvenance(root) {
   const manifestPath = join(root, "PUBLIC_EXPORT_MANIFEST.json");
@@ -38,8 +57,7 @@ export async function writeExportProvenance(root) {
   const manifest = JSON.parse(original);
   const updated = [];
   for (const file of manifest.files) {
-    let buffer;
-    try { buffer = await readFile(join(root, file.path)); } catch { continue; }
+    const buffer = await readExportedFile(root, file.path);
     const sha256 = createHash("sha256").update(buffer).digest("hex");
     if (buffer.length !== file.size || sha256 !== file.sha256) {
       file.size = buffer.length;
@@ -49,13 +67,12 @@ export async function writeExportProvenance(root) {
   }
   let sanitized = 0;
   for (const file of manifest.files) {
-    let buffer;
-    try { buffer = await readFile(join(root, file.path)); } catch { continue; }
+    const buffer = await readExportedFile(root, file.path);
     if (blobId(buffer, file.sourceObjectId) !== file.sourceObjectId) sanitized += 1;
   }
   manifest.transformations = sanitized;
   const next = `${JSON.stringify(manifest, null, 2)}${original.endsWith("\n") ? "\n" : ""}`;
-  if (next !== original) await writeFile(manifestPath, next);
+  if (next !== original) await replaceFileAtomically(manifestPath, next);
   return { updated, transformations: sanitized, files: manifest.files.length };
 }
 

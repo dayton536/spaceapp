@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -39,4 +39,18 @@ test("write mode records the new bytes and counts the edited file as sanitized",
   const result = await verifyExportProvenance(root);
   assert.deepEqual(result.problems, []);
   assert.deepEqual(result.sanitized, ["edited.txt"]);
+  assert.deepEqual((await readdir(root)).filter((name) => name.endsWith(".tmp")), []);
+});
+
+test("write mode leaves the manifest unchanged when a listed file cannot be read", async () => {
+  const root = await mkdtemp(join(tmpdir(), "spaceapp-provenance-missing-"));
+  const manifestPath = join(root, "PUBLIC_EXPORT_MANIFEST.json");
+  const files = [
+    { path: "missing.txt", sourceObjectId: blob("x\n"), sha256: sha256("x\n"), size: 2 }
+  ];
+  const original = JSON.stringify({ sourceCommit: "a".repeat(40), transformations: 0, files });
+  await writeFile(manifestPath, original);
+  await assert.rejects(() => writeExportProvenance(root), /Cannot read exported file missing\.txt/);
+  assert.equal(await readFile(manifestPath, "utf8"), original);
+  assert.deepEqual((await readdir(root)).filter((name) => name.endsWith(".tmp")), []);
 });
