@@ -9,6 +9,8 @@ import type { DesignAsset, DesignBrandKit, DesignBrandKitInput, DesignEvent, Des
 import type { AppStudioEvent, AppStudioPaneMetadata, AppStudioPreview, AppStudioRunStatus } from "@space/contracts";
 import type { SecurityCopilotPaneMetadata, SecurityEvent, SecurityMemory } from "@space/contracts";
 import type { SecurityCopilotState, SecurityFindingView, SecurityRunView } from "./features/security-copilot-pane/types.js";
+import type { MonitoringCopilotPaneMetadata, MonitoringEvent, MonitoringMemory } from "@space/contracts";
+import type { MonitoringCopilotState, MonitoringRunView, MonitoringTargetView } from "./features/monitoring-copilot-pane/types.js";
 import type { VideoAsset, VideoAssetKind, VideoEvent, VideoJob, VideoPaneMetadata, VideoRequest, VideoRequestCreateInput, VideoRequestStatus, VideoView } from "@space/contracts";
 import type { SetupClientRuntimeFeatureId, SetupClientRuntimeChallenge, SetupClientRuntimeObservation } from "@space/contracts";
 import type { MaintenancePlanRequest, MaintenanceApplyRequest, MaintenanceAutopilotStatus, MaintenanceAutopilotScheduleUpdate } from "@space/contracts";
@@ -73,6 +75,7 @@ export interface GoogleBrowserCheckSummary {
   connectedAt: string | null;
 }
 import type { YouTubePlayback } from "./features/browser-pane/youtube-playback.js";
+import { learnServerClock } from "./server-clock.js";
 import type {
   Artifact,
   AgentPaneHistoryItem,
@@ -207,6 +210,10 @@ import type {
   NousPaneBoardAnswerResult,
   NousAway,
   NousAwayGrant,
+  NousGoal,
+  NousGoalEditInput,
+  NousGoalsView,
+  NousStandingApproval,
   NousSettings,
   NousState,
   ListSharedChatMessagesQuery,
@@ -861,6 +868,85 @@ function looksLikeJsonPayload(raw: string): boolean {
   return trimmed.startsWith("{") || trimmed.startsWith("[");
 }
 
+/**
+ * Reads a response body in stream chunks, then transfers the bytes to the parse worker.
+ * Used when the 3D view asks for more than the default 2,000-node overview.
+ */
+async function requestLargeMemoryOverview(url: string): Promise<MemoryGraphOverviewResponse> {
+  const requestStartedAt = Date.now();
+  const response = await fetch(url, { credentials: "include" });
+  learnServerClock(response);
+  if (!response.ok) {
+    const payload = await readResponsePayload(response);
+    reportCoreApiResponse(response, payload, requestStartedAt);
+    if (isApiErrorPayload(payload)) {
+      throw new SpaceApiError(formatApiError(payload, `Request failed: ${response.status}`), {
+        code: payload.error.code,
+        status: response.status,
+        requestId: payload.error.requestId,
+        details: payload.error.details
+      });
+    }
+    throw new SpaceApiError(formatHttpFailure(response.status, payload), { status: response.status });
+  }
+  const buffer = await readResponseBuffer(response);
+  reportCoreApiResponse(response, null, requestStartedAt);
+  if (buffer.byteLength < 1_500_000) {
+    const text = new TextDecoder().decode(buffer);
+    return (text ? JSON.parse(text) : { data: { nodes: [], edges: [] } }) as MemoryGraphOverviewResponse;
+  }
+  return parseOverviewInWorker(buffer);
+}
+
+async function readResponseBuffer(response: Response): Promise<ArrayBuffer> {
+  const reader = response.body?.getReader();
+  if (!reader) return response.arrayBuffer();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    parts.push(value);
+    total += value.byteLength;
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    bytes.set(part, offset);
+    offset += part.byteLength;
+    if (parts.length > 4) await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  return bytes.buffer;
+}
+
+function parseOverviewInWorker(buffer: ArrayBuffer): Promise<MemoryGraphOverviewResponse> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./features/memory-workspace/memory-overview-parse.worker.ts", import.meta.url), { type: "module" });
+    const nodes: MemoryGraphOverviewPayload["nodes"] = [];
+    const edges: MemoryGraphOverviewPayload["edges"] = [];
+    let header: Partial<MemoryGraphOverviewPayload> = {};
+    worker.onmessage = (event: MessageEvent<{ kind: string; header?: Partial<MemoryGraphOverviewPayload>; nodes?: MemoryGraphOverviewPayload["nodes"]; edges?: MemoryGraphOverviewPayload["edges"]; message?: string }>) => {
+      const message = event.data;
+      if (message.kind === "header" && message.header) header = message.header;
+      else if (message.kind === "nodes" && message.nodes) nodes.push(...message.nodes);
+      else if (message.kind === "edges" && message.edges) edges.push(...message.edges);
+      else if (message.kind === "done") {
+        worker.terminate();
+        resolve({ data: { ...header, nodes, edges } as MemoryGraphOverviewPayload });
+      } else if (message.kind === "error") {
+        worker.terminate();
+        reject(new SpaceApiError(message.message ?? "Overview parse failed", { status: 500 }));
+      }
+    };
+    worker.onerror = () => {
+      worker.terminate();
+      reject(new SpaceApiError("Overview parse failed", { status: 500 }));
+    };
+    worker.postMessage(buffer, [buffer]);
+  });
+}
+
 async function readResponsePayload(response: Response): Promise<unknown> {
   if (typeof response.text !== "function") {
     if (typeof response.json === "function") {
@@ -990,6 +1076,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     reportCoreApiFailure(requestStartedAt);
     throw upstreamTransportError(error);
   }
+  learnServerClock(response);
 
   const payload = await readResponsePayload(response);
   reportCoreApiResponse(response, payload, requestStartedAt);
@@ -1632,7 +1719,7 @@ export const api = {
   vaultRevokeSignupGrant: (id: string) => request<{ revoked: true }>(`/api/space-vault/signup-grants/${encodeURIComponent(id)}`, { method: "DELETE" }),
   // API keys handed to agents (plan clipboard:-qvpC_Q0rAVg): the value goes in once and never comes back out here.
   vaultHandoffKeys: () => request<{ keys: VaultHandoffKey[] }>("/api/space-vault/keys"),
-  vaultCreateHandoffKey: (body: { label: string; value: string; expiresInHours: number }) => request<{ key: VaultHandoffKey }>("/api/space-vault/keys", { method: "POST", body: JSON.stringify(body) }),
+  vaultCreateHandoffKey: (body: { label: string; value: string; expiresInHours: number | null; kept: boolean }) => request<{ key: VaultHandoffKey }>("/api/space-vault/keys", { method: "POST", body: JSON.stringify(body) }),
   vaultDeleteHandoffKey: (id: string) => request<{ deleted: true }>(`/api/space-vault/keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
   vaultAudit: (beforeSeq?: number) => request<{ entries: Array<{ id: string; seq: number; event: VaultAuditRecord; createdAt: string }>; nextBeforeSeq: number | null }>(
     `/api/space-vault/audit?limit=50${beforeSeq ? `&beforeSeq=${beforeSeq}` : ""}`),
@@ -1678,6 +1765,13 @@ export const api = {
     request<{ files: Array<{ ref: string; text: string | null; total: number | null; truncated: boolean; error?: string }> }>(`/api/nous/decisions/${encodeURIComponent(id)}/files`),
   nousDecisionFeedback: (id: string, couldHaveDecided: boolean) =>
     request<{ decision: NousDecision }>(`/api/nous/decisions/${encodeURIComponent(id)}/feedback`, { method: "POST", body: JSON.stringify({ couldHaveDecided }) }),
+  /** Nous Goals (plan clipboard:DR51jZJEB0j1): the operator's standing objectives; every write from a person only. */
+  nousGoals: () => request<{ view: NousGoalsView }>("/api/nous/goals"),
+  nousAlwaysApprove: () => request<{ rules: Array<NousStandingApproval & { count: number }> }>("/api/nous/always-approve"),
+  createNousGoal: (text: string) => request<{ goal: NousGoal }>("/api/nous/goals", { method: "POST", body: JSON.stringify({ text }) }),
+  updateNousGoal: (id: string, input: NousGoalEditInput) => request<{ goal: NousGoal }>(`/api/nous/goals/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  reorderNousGoals: (ids: string[]) => request<{ goals: NousGoal[] }>("/api/nous/goals/reorder", { method: "POST", body: JSON.stringify({ ids }) }),
+  deleteNousGoal: (id: string) => request<{ removed: boolean }>(`/api/nous/goals/${encodeURIComponent(id)}`, { method: "DELETE" }),
   taskItems: (query: { q?: string; status?: TaskStatus; source?: TaskSource; page?: number; pageSize?: number } = {}) => {
     const params = new URLSearchParams();
     if (query.q) params.set("q", query.q);
@@ -1850,6 +1944,9 @@ export const api = {
   notification: (id: string) => request<{ notification: import("@space/contracts").SpaceNotification }>(`/api/notifications/${encodeURIComponent(id)}`, { cache: "no-store" }),
   markNotificationRead: (id: string) => request<{ notification: import("@space/contracts").SpaceNotification }>(`/api/notifications/${encodeURIComponent(id)}/read`, { method: "POST" }),
   ackNotification: (id: string) => request<{ notification: import("@space/contracts").SpaceNotification }>(`/api/notifications/${encodeURIComponent(id)}/ack`, { method: "POST" }),
+  /** Needs you as questions (plan clipboard:5AQvaoSR-IZa): the operator's answer from the card goes where the record's ask says. */
+  answerNotification: (id: string, input: import("@space/contracts").NotificationAnswerInput) => request<import("@space/contracts").NotificationAnswerResult>(`/api/notifications/${encodeURIComponent(id)}/answer`,
+    { method: "POST", body: JSON.stringify(input) }),
   readAllNotifications: () => request<{ read: number }>("/api/notifications/read-all", { method: "POST" }),
   testNotification: () => request<{ notification: import("@space/contracts").SpaceNotification }>("/api/notifications/test", { method: "POST" }),
   // The Android app's FCM token while "Push notifications on this device" is on; `available` says whether the server can push.
@@ -2991,6 +3088,8 @@ export const api = {
       | { type: "set_viewport"; viewport: BrowserSessionViewport; sessionId?: string }
       | { type: "diagnostics"; includeNetwork?: boolean; limit?: number; sessionId?: string }
       | { type: "record"; durationMs?: number; intervalMs?: number; format?: "frames" | "gif" | "webm" | "both"; sessionId?: string }
+      | { type: "select_state"; sessionId?: string }
+      | { type: "select_choose"; index: number; sessionId?: string }
   ) =>
     request<BrowserToolActionResult>(`/api/panes/${encodeURIComponent(paneId)}/browser/action`, {
       method: "POST",
@@ -3230,6 +3329,10 @@ export const api = {
     lifecycleStatus?: MemoryLifecycleStatus;
     month?: string;
     relationMode?: "CLUSTERED" | "RELATIONS";
+    /** Node budget. Defaults to 2,000 on the server. Values above 2,000 are parsed off the main thread. */
+    limit?: number;
+    /** Demo-only. The live client never puts this on the query string. */
+    syntheticNodes?: number;
   } = {}) => {
     const params = new URLSearchParams();
     if (query.q) params.set("q", query.q);
@@ -3240,8 +3343,11 @@ export const api = {
     if (query.lifecycleStatus) params.set("lifecycleStatus", query.lifecycleStatus);
     if (query.month) params.set("month", query.month);
     if (query.relationMode) params.set("relationMode", query.relationMode);
+    if (query.limit) params.set("limit", String(query.limit));
     const suffix = params.toString();
-    return request<MemoryGraphOverviewResponse>(`/api/admin/memory/graph/overview${suffix ? `?${suffix}` : ""}`);
+    const url = `/api/admin/memory/graph/overview${suffix ? `?${suffix}` : ""}`;
+    if (!query.limit || query.limit <= 2_000 || typeof Worker === "undefined") return request<MemoryGraphOverviewResponse>(url);
+    return requestLargeMemoryOverview(url);
   },
   memoryCalendar: (query: MemoryCalendarQuery = {}) => {
     const params = new URLSearchParams();
@@ -4127,6 +4233,26 @@ export const api = {
     request<SecurityRunView & { kickoffSent: boolean }>(`/api/panes/${encodeURIComponent(paneId)}/security-copilot/run/${action}`, { method: "POST", body: "{}" }),
   checkSecurityCopilotNow: (paneId: string) =>
     request<{ owners: number; newFindings: number; kicked: number }>(`/api/panes/${encodeURIComponent(paneId)}/security-copilot/watch`, { method: "POST", body: "{}" }),
+  // Monitoring Copilot pane: everything the pane shows in one read, the collector's targets, settings, briefs, answers, memory, the run and "Check now".
+  monitoringCopilotState: (paneId: string) => request<MonitoringCopilotState>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/state`, { cache: "no-store" }),
+  monitoringCopilotTargets: (paneId: string) => request<{ targets: MonitoringTargetView[] }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/targets`, { cache: "no-store" }),
+  updateMonitoringCopilotSettings: (paneId: string, metadata: MonitoringCopilotPaneMetadata) =>
+    request<{ metadata: MonitoringCopilotPaneMetadata }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/settings`, { method: "PUT", body: JSON.stringify(metadata) }),
+  createMonitoringCopilotBrief: (paneId: string, text: string) =>
+    request<{ brief: MonitoringEvent; kickoffSent: boolean }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/briefs`, { method: "POST", body: JSON.stringify({ text }) }),
+  decideMonitoringCopilotReview: (paneId: string, reviewId: string, approve: boolean, note?: string) =>
+    request<{ review: MonitoringEvent }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/reviews/${encodeURIComponent(reviewId)}/decide`, { method: "POST", body: JSON.stringify({ approve, ...(note ? { note } : {}) }) }),
+  answerMonitoringCopilotQuestion: (paneId: string, questionId: string, answer: string) =>
+    request<{ question: MonitoringEvent }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/questions/${encodeURIComponent(questionId)}/answer`, { method: "POST", body: JSON.stringify({ answer }) }),
+  monitoringCopilotMemory: (paneId: string) => request<{ memories: MonitoringMemory[] }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/memory`, { cache: "no-store" }),
+  createMonitoringCopilotMemory: (paneId: string, input: { kind: MonitoringMemory["kind"]; key?: string; text: string; pinned?: boolean }) =>
+    request<{ memory: MonitoringMemory }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/memory`, { method: "POST", body: JSON.stringify(input) }),
+  deleteMonitoringCopilotMemory: (paneId: string, memoryId: string) =>
+    request<{ deleted: true }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/memory/${encodeURIComponent(memoryId)}`, { method: "DELETE" }),
+  monitoringCopilotRun: (paneId: string, action: "start" | "pause" | "stop") =>
+    request<MonitoringRunView & { kickoffSent: boolean }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/run/${action}`, { method: "POST", body: "{}" }),
+  checkMonitoringCopilotNow: (paneId: string) =>
+    request<{ owners: number; fired: number; resolved: number; guardian: number }>(`/api/panes/${encodeURIComponent(paneId)}/monitoring-copilot/watch`, { method: "POST", body: "{}" }),
   createDesignBrandKit: (input: DesignBrandKitInput) => request<{ brandKit: DesignBrandKit }>("/api/design/brand-kits", { method: "POST", body: JSON.stringify(input) }),
   updateDesignBrandKit: (id: string, input: Partial<DesignBrandKitInput>) =>
     request<{ brandKit: DesignBrandKit }>(`/api/design/brand-kits/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(input) }),

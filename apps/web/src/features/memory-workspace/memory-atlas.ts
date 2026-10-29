@@ -5,8 +5,28 @@ import { isMemoryCoreLabel } from "./memory-graph-visuals.js";
 export const ATLAS_COLORS = ["#57ccff", "#ff79bc", "#ab95ff", "#53e2ba", "#ffc56c", "#fa887e", "#a0df73", "#8caaff"];
 export type MemoryAtlasPosition = { x: number; y: number; color: string; hub: boolean; groupId: string; monthLabel?: string };
 export type MemoryAtlasGroup = { id: string; label: string; color: string; count: number; kind: "tag" | "topic" | "month" | "archive" };
-export const memorySourceMonth = (node: MemoryGraphNode) => node.sourcePath?.match(/(?:^|[_/-])(20\d{2}-(?:0[1-9]|1[0-2]))(?:[_. /-]|$)/)?.[1] ?? null;
-export const memoryMonthLabel = (month: string) => new Date(`${month}-01T00:00:00Z`).toLocaleDateString("en", { month: "short", year: "numeric", timeZone: "UTC" });
+const sourceMonthCache = new Map<string, string | null>();
+const monthLabelCache = new Map<string, string>();
+
+/** Month embedded in a canonical source path, cached so a large archive does not re-run the match per node. */
+export const memorySourceMonth = (node: MemoryGraphNode) => {
+  const path = node.sourcePath;
+  if (!path) return null;
+  const cached = sourceMonthCache.get(path);
+  if (cached !== undefined) return cached;
+  const month = path.match(/(?:^|[_/-])(20\d{2}-(?:0[1-9]|1[0-2]))(?:[_. /-]|$)/)?.[1] ?? null;
+  sourceMonthCache.set(path, month);
+  return month;
+};
+
+/** Short month label, cached by `YYYY-MM` so overview loads do not format one date per node. */
+export const memoryMonthLabel = (month: string) => {
+  const cached = monthLabelCache.get(month);
+  if (cached) return cached;
+  const label = new Date(`${month}-01T00:00:00Z`).toLocaleDateString("en", { month: "short", year: "numeric", timeZone: "UTC" });
+  monthLabelCache.set(month, label);
+  return label;
+};
 
 export const MIN_ATLAS_TAG_COUNT = 10;
 
@@ -58,7 +78,11 @@ export function createMemoryAtlas(nodes: MemoryGraphNode[], edges: MemoryGraphEd
   let visibleNodes = nodes.filter(node => node.type === "MEMORY" || node.type === "SOURCE" || node.type === "ROOM" || topicIds.has(node.id));
   if (!visibleNodes.length) visibleNodes = nodes;
   const ids = new Set(visibleNodes.map(node => node.id));
-  const visibleEdges = edges.filter(edge => ids.has(edge.source) && ids.has(edge.target));
+  let danglingEdge = false;
+  for (const edge of edges) {
+    if (!ids.has(edge.source) || !ids.has(edge.target)) { danglingEdge = true; break; }
+  }
+  const visibleEdges = danglingEdge ? edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)) : edges;
   const residualMonths = new Map<string, number>();
   for (const node of visibleNodes) {
     if (assignments.has(node.id)) continue;
@@ -67,40 +91,51 @@ export function createMemoryAtlas(nodes: MemoryGraphNode[], edges: MemoryGraphEd
   }
   const monthSlots = 8;
   const monthKeys = [...residualMonths].sort((a, b) => b[1] - a[1] || b[0].localeCompare(a[0])).slice(0, monthSlots).map(([month]) => month).sort();
+  const monthKeySet = new Set(monthKeys);
   const groupInfo = new Map<string, Pick<MemoryAtlasGroup, "label" | "kind">>(anchors.map(topic => [topic.id, { label: topic.label, kind: explicit.has(topic.id) ? "tag" : "topic" }]));
   for (const month of monthKeys) groupInfo.set(`month:${month}`, { label: memoryMonthLabel(month), kind: "month" });
   for (const node of visibleNodes) {
     if (assignments.has(node.id)) continue;
     const month = memorySourceMonth(node);
-    const group = month && monthKeys.includes(month) ? `month:${month}` : "archive:other";
+    const group = month && monthKeySet.has(month) ? `month:${month}` : "archive:other";
     assignments.set(node.id, group);
     if (!groupInfo.has(group)) groupInfo.set(group, { label: month ? "Other months" : "Other knowledge", kind: "archive" });
   }
   const buckets = new Map<string, MemoryGraphNode[]>();
-  for (const node of [...visibleNodes].sort((a, b) => a.id.localeCompare(b.id))) {
+  const orderedNodes = visibleNodes.length > 4_000
+    ? [...visibleNodes].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+    : [...visibleNodes].sort((a, b) => a.id.localeCompare(b.id));
+  for (const node of orderedNodes) {
     const group = assignments.get(node.id)!;
-    if (!buckets.has(group)) buckets.set(group, []);
-    buckets.get(group)!.push(node);
+    let bucket = buckets.get(group);
+    if (!bucket) { bucket = []; buckets.set(group, bucket); }
+    bucket.push(node);
   }
   const positions = new Map<string, MemoryAtlasPosition>();
   const groups: MemoryAtlasGroup[] = [];
   const activeGroups = [...groupInfo].filter(([id]) => buckets.has(id));
-  const networkPositions = computeLayout ? layoutMemoryNetwork(visibleNodes, visibleEdges) : new Map(visibleNodes.map((node, index) => [node.id, node.position?.relations ?? { x: index % 40, y: Math.floor(index / 40) }]));
+  const networkPositions = computeLayout ? layoutMemoryNetwork(visibleNodes, visibleEdges) : null;
+  const anchorIds = new Set(anchors.map(anchor => anchor.id));
   activeGroups.forEach(([groupId, info], groupIndex) => {
     const members = buckets.get(groupId)!;
     const color = info.kind === "archive" ? "#7395ad" : ATLAS_COLORS[groupIndex % ATLAS_COLORS.length]!;
-    groups.push({ id: groupId, ...info, color, count: members.filter(node => node.type === "MEMORY").length });
-    members.forEach(node => {
-      const hub = node.type === "SOURCE" || anchors.some(anchor => anchor.id === node.id);
-      const position = networkPositions.get(node.id)!;
+    let memoryCount = 0;
+    for (const member of members) if (member.type === "MEMORY") memoryCount += 1;
+    groups.push({ id: groupId, ...info, color, count: memoryCount });
+    for (let index = 0; index < members.length; index++) {
+      const node = members[index]!;
+      const hub = node.type === "SOURCE" || anchorIds.has(node.id);
+      const position = networkPositions?.get(node.id) ?? node.position?.relations ?? { x: index % 40, y: Math.floor(index / 40) };
       const month = memorySourceMonth(node);
-      positions.set(node.id, { ...position, color: isMemoryCoreLabel(node.label) ? "#fff0b0" : color, hub, groupId, ...(month ? { monthLabel: memoryMonthLabel(month) } : {}) });
-    });
+      positions.set(node.id, { x: position.x, y: position.y, color: isMemoryCoreLabel(node.label) ? "#fff0b0" : color, hub, groupId, ...(month ? { monthLabel: memoryMonthLabel(month) } : {}) });
+    }
   });
+  let semanticCount = 0;
+  for (const edge of visibleEdges) if (edge.type === "SEMANTICALLY_RELATED") semanticCount += 1;
   return {
     nodes: visibleNodes, edges: visibleEdges, positions, groups,
     topics: anchors.map(node => ({ ...node, color: groups.find(group => group.id === node.id)!.color, count: topicMembers.get(node.id)!.size, explicit: explicit.has(node.id) })),
     explicitCount: explicit.size,
-    semanticCount: visibleEdges.filter(edge => edge.type === "SEMANTICALLY_RELATED").length
+    semanticCount
   };
 }

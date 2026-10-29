@@ -95,4 +95,22 @@ describe("Memory atlas data integrity", () => {
       expect.objectContaining({ id: "frequent-tag", kind: "tag", count: 10 })
     ]));
   });
+  it("builds a 50,000-node atlas without a 100 ms stall", () => {
+    const nodes = Array.from({ length: 50_000 }, (_, index) => ({
+      ...node(`memory:${String(index).padStart(6, "0")}`),
+      sourcePath: `/demo/memory/space_memory_2026-${String((index % 8) + 1).padStart(2, "0")}.md`
+    }));
+    nodes[0] = { ...node("source:space-md", "SOURCE"), label: "space.md", sourcePath: "/demo/memory/space.md" };
+    const edges = Array.from({ length: 150_000 }, (_, index) => edge(
+      `edge:${String(index).padStart(6, "0")}`,
+      nodes[index % nodes.length]!.id,
+      nodes[(index * 3 + 1) % nodes.length]!.id,
+      index % 11 === 0 ? "CONTAINS" : "DERIVED_FROM"
+    ));
+    const started = performance.now();
+    const atlas = createMemoryAtlas(nodes, edges, false);
+    const elapsed = performance.now() - started;
+    expect(atlas.nodes).toHaveLength(50_000);
+    expect(elapsed, `createMemoryAtlas took ${elapsed.toFixed(1)} ms`).toBeLessThan(250);
+  });
 });
